@@ -1,0 +1,25 @@
+name: tests
+
+# Enforce the test suite on every push and PR, independent of the local
+# pre-commit hook (which requires `git config core.hooksPath .githooks` on a
+# fresh clone and so can be silently skipped). The suite is pure stdlib, no
+# network, no money, no data files, so CI needs nothing installed.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run the Python test suite
+        run: python3 tests.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run the MCP server tests
+        run: node --test api/*.test.js

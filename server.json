@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.whatagentsbuy/whatagentsbuy",
+  "title": "What Agents Buy",
+  "description": "Independent measured reviews of x402 API sellers: pre-payment verdicts and accuracy grades.",
+  "version": "1.0.1",
+  "repository": {
+    "url": "https://github.com/neilkpatel/whatagentsbuy",
+    "source": "github"
+  },
+  "websiteUrl": "https://whatagentsbuy.com",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://whatagentsbuy.com/mcp"
+    }
+  ]
+}

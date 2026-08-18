@@ -1,0 +1,20 @@
+{
+  "name": "preflight-x402",
+  "version": "0.1.0",
+  "description": "Gate an x402 / HTTP 402 agent payment on an independent CLEAR/HOLD/ABORT verdict from whatagentsbuy.com. Abort before you sign.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": "./index.mjs",
+  "files": ["index.mjs", "README.md"],
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "keywords": [
+    "x402", "402", "agentic-payments", "agentic-commerce", "usdc", "base",
+    "ai-agents", "mcp", "preflight", "payment-safety"
+  ],
+  "license": "MIT",
+  "homepage": "https://whatagentsbuy.com",
+  "repository": { "type": "git", "url": "git+https://github.com/neilkpatel/whatagentsbuy.git", "directory": "preflight-x402" },
+  "engines": { "node": ">=18" }
+}
