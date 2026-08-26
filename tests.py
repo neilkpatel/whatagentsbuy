@@ -530,7 +530,7 @@ def test_accuracy_receipt_grades_against_primary_source():
             host="feed.example", url="https://feed.example/price", quoted="0.001",
             paid=True, metric="BTC/USD price", returned=returned, truth=63147.6,
             source="median of coinbase/kraken", dev_value=dev, tol_value=tol,
-            unit="bps", field=".price", ts="2026-08-14", url_index={})
+            unit="bps", field=".price", ts="2026-08-14", cap_index={})
 
     ok = mk(63121.8, -2.1)
     bad = mk(61000.0, -340.0)
@@ -590,7 +590,7 @@ def test_regrading_supersedes_not_duplicates():
             quoted="0.001", paid=True, metric="BTC/USD price",
             returned=(None if status_dev is None else 63765.9), truth=63147.6,
             source="median", dev_value=status_dev, tol_value=50.0, unit="bps",
-            field=".x", ts="2026-08-14", url_index={})
+            field=".x", ts="2026-08-14", cap_index={})
 
     off = mk(99.9)
     inconclusive = mk(None)
@@ -614,6 +614,543 @@ def test_receipt_carries_shape_not_goods():
     for leaked in ("mp3", "base64", "hello", "0.5", "aGVsbG8"):
         check(f"receipt leaks no goods value ({leaked})", leaked not in blob)
 
+
+# --- settlement binding (v2): tx + archived stdout digest -------------------
+_FULL_TX = "0x" + "a" * 64
+_FULL_TX_UPPER = "0x" + "A" * 64
+_OTHER_TX = "0x" + "b" * 64
+
+
+def _accuracy_v2(**kw):
+    import receipts
+    defaults = dict(
+        host="feed.example", url="https://feed.example/price", quoted="0.001",
+        paid=True, metric="BTC/USD price", returned=63121.8, truth=63147.6,
+        source="median of coinbase/kraken", dev_value=-2.1, tol_value=50.0,
+        unit="bps", field=".price", ts="2026-08-14", cap_index={}, tx=_FULL_TX)
+    defaults.update(kw)
+    return receipts._accuracy_receipt(**defaults)
+
+
+def _archive_pair(url, tx, stdout, cap_dir):
+    import conform, os
+    conform.archive_raw(url, "GET", None, 0, stdout, "", out_dir=cap_dir)
+    cap = os.path.join(cap_dir, [f for f in os.listdir(cap_dir) if f.startswith("raw_")][0])
+    return {"capture": os.path.basename(cap), "line": 0,
+            "match": {"url": url, "tx": tx}, "tx": tx}
+
+
+def test_accuracy_v2_binds_settlement_tx():
+    import receipts
+    r = _accuracy_v2()
+    check("accuracy v2 when tx bound", r["version"] == "2")
+    check("tx is normalized lowercase", r["payment"]["tx"] == _FULL_TX)
+    check("chain is canonical", r["payment"]["chain"] == "base")
+    check("fresh v2 accuracy verifies", receipts.verify_receipt(r)["integrity"] is True)
+    tampered = json.loads(json.dumps(r))
+    tampered["payment"]["tx"] = _OTHER_TX
+    check("swapping payment.tx breaks integrity",
+          receipts.verify_receipt(tampered)["integrity"] is False)
+    chain_hit = json.loads(json.dumps(r))
+    chain_hit["payment"]["chain"] = "ethereum"
+    check("swapping payment.chain breaks integrity",
+          receipts.verify_receipt(chain_hit)["integrity"] is False)
+
+
+def test_accuracy_v1_legacy_without_tx_still_verifies():
+    import receipts
+    r = _accuracy_v2(tx=None, paid=False)
+    check("unpaid accuracy stays v1", r["version"] == "1")
+    check("legacy v1 integrity holds", receipts.verify_receipt(r)["integrity"] is True)
+    check("legacy v1 has no response binding", receipts.verify_receipt(r)["response"] is None)
+
+
+def test_tx_normalization_case_and_rejects_malformed():
+    import receipts
+    a = _accuracy_v2(tx=_FULL_TX_UPPER)
+    b = _accuracy_v2(tx=_FULL_TX)
+    check("tx case normalizes to same id", a["receipt_id"] == b["receipt_id"])
+    bad = _accuracy_v2(tx="0xshort")
+    check("malformed tx is not bound", bad["version"] == "1" and bad["payment"]["tx"] is None)
+    check("wrong prefix tx is not bound", _accuracy_v2(tx="dead" + "a" * 64)["version"] == "1")
+
+
+def test_response_digest_binds_archived_stdout():
+    import receipts, tempfile, os
+    url = "https://feed.example/price"
+    stdout = json.dumps({"success": True, "data": {"price": 1},
+                         "metadata": {"payment": {"success": True,
+                                                  "transactionHash": _FULL_TX}}})
+    with tempfile.TemporaryDirectory() as d:
+        ref = _archive_pair(url, _FULL_TX, stdout, d)
+        cap_index = {(url, _FULL_TX): ref}
+        _orig = receipts.CAPTURES
+        try:
+            receipts.CAPTURES = d
+            r = _accuracy_v2(cap_index=cap_index)
+            v = receipts.verify_receipt(r)
+            check("fresh digest-only path self-consistent",
+                  receipts.verify_receipt(r)["integrity"] is True)
+            swapped = json.loads(json.dumps(r))
+            swapped["delivery"]["response_digest"] = "0" * 64
+            wrong_ref = json.loads(json.dumps(r))
+            wrong_ref["delivery"]["raw_ref"] = dict(ref)
+            wrong_ref["delivery"]["raw_ref"]["match"] = {"url": url, "tx": _OTHER_TX}
+            wrong_ref["delivery"]["raw_ref"]["tx"] = _OTHER_TX
+            resp_fail = receipts.verify_receipt(wrong_ref)["response"]
+        finally:
+            receipts.CAPTURES = _orig
+    check("v2 binds stdout digest", r["version"] == "2" and r["delivery"].get("response_digest"))
+    check("digest reproduces from archive", v["response"] is True)
+    check("mutating digest breaks integrity", receipts.verify_receipt(swapped)["integrity"] is False)
+    check("conflicting raw_ref tx fails response binding", resp_fail is False)
+
+
+def test_delivery_v2_binds_stdout_when_archived():
+    import receipts, conform, tempfile, os
+    url = "https://ok.example/tts"
+    stdout = json.dumps({"success": True, "data": {"content_type": "audio", "description": "x"},
+                         "metadata": {"payment": {"success": True, "transactionHash": _FULL_TX}}})
+    row = dict(_DELIVERED_ROW)
+    row["url"] = url
+    row["tx"] = _FULL_TX
+    with tempfile.TemporaryDirectory() as d:
+        conform.archive_raw(url, "GET", None, 0, stdout, "", out_dir=d)
+        cap = os.path.join(d, [f for f in os.listdir(d) if f.startswith("raw_")][0])
+        ref = {"capture": os.path.basename(cap), "line": 0,
+               "match": {"url": url, "tx": _FULL_TX}}
+        _orig = receipts.CAPTURES
+        try:
+            receipts.CAPTURES = d
+            r = receipts.receipt_from_conformance(row, cap_index={(url, _FULL_TX): ref})
+            tx_fail = receipts.verify_receipt(
+                json.loads(json.dumps({**r, "payment": {**r["payment"], "tx": _OTHER_TX}}))
+            )["integrity"]
+        finally:
+            receipts.CAPTURES = _orig
+    check("delivery with archive is v2", r["version"] == "2")
+    check("delivery tx swap fails integrity", tx_fail is False)
+
+
+def test_digest_only_v2_accuracy_without_tx_is_self_consistent():
+    import receipts
+    digest = "a" * 64
+    ev = {
+        "url": "https://free.example/price", "host": "free.example",
+        "quoted": "0", "paid": False, "metric": "BTC/USD", "returned": 1.0,
+        "truth": 2.0, "truth_source": "ref", "dev_value": 0.0, "tol_value": 1.0,
+        "unit": "USD", "field": ".price", "status": "accurate",
+        "response_digest": digest,
+    }
+    rid = receipts.content_id(ev)
+    r = {
+        "receipt_id": rid, "version": "2", "kind": "accuracy", "ts": "2026-08-14",
+        "seller": {"host": "free.example", "url": ev["url"]},
+        "promise": {"price_usdc": "0", "metric": "BTC/USD",
+                    "source": "x402 Bazaar (CDP discovery)"},
+        "payment": {"charged_usdc": "0", "paid": False, "free": True,
+                    "tx": None, "chain": "base",
+                    "settlement": "EIP-3009, submitted by a facilitator"},
+        "delivery": {"returned": 1.0, "field": ".price", "raw_ref": None,
+                     "response_digest": digest},
+        "truth": {"value": 2.0, "source": "ref", "deviation": "+0 USD",
+                  "tolerance": "±1 USD", "dev_value": 0.0, "tol_value": 1.0, "unit": "USD"},
+        "verdict": {"status": "accurate", "why": "within tolerance of the primary source",
+                    "reverified": False, "decided_by": "single call",
+                    "method": "returned value vs a primary source, within a stated tolerance"},
+    }
+    v = receipts.verify_receipt(r)
+    check("digest-only v2 omits tx from evidence hash", "tx" not in receipts.evidence_of(r, "2"))
+    check("digest-only v2 self-consistent", v["integrity"] is True)
+    check("digest-only v2 response unknown without archive", v["response"] is None)
+
+
+def test_receipt_version_rejects_unknown():
+    import receipts
+    base = _accuracy_v2()
+    for bad in ("0", "3", "10", " 2", "2 ", 2, None):
+        r = json.loads(json.dumps(base))
+        r["version"] = bad
+        v = receipts.verify_receipt(r)
+        check(f"version {bad!r} fails closed", v["integrity"] is False and v["verdict"] is None)
+
+
+def test_v1_relabel_to_v2_without_binding_fails():
+    import receipts
+    r = _accuracy_v2(tx=None, paid=False)
+    check("baseline v1 intact", receipts.verify_receipt(r)["integrity"] is True)
+    relabeled = json.loads(json.dumps(r))
+    relabeled["version"] = "2"
+    check("v1 relabeled v2 fails closed", receipts.verify_receipt(relabeled)["integrity"] is False)
+
+
+def _digest_only_v2_receipt():
+    import receipts
+    digest = "a" * 64
+    ev = {
+        "url": "https://free.example/price", "host": "free.example",
+        "quoted": "0", "paid": False, "metric": "BTC/USD", "returned": 1.0,
+        "truth": 2.0, "truth_source": "ref", "dev_value": 0.0, "tol_value": 1.0,
+        "unit": "USD", "field": ".price", "status": "accurate",
+        "response_digest": digest,
+    }
+    return {
+        "receipt_id": receipts.content_id(ev), "version": "2", "kind": "accuracy",
+        "ts": "2026-08-14",
+        "seller": {"host": "free.example", "url": ev["url"]},
+        "promise": {"price_usdc": "0", "metric": "BTC/USD",
+                    "source": "x402 Bazaar (CDP discovery)"},
+        "payment": {"charged_usdc": "0", "paid": False, "free": True,
+                    "tx": None, "chain": "base",
+                    "settlement": "EIP-3009, submitted by a facilitator"},
+        "delivery": {"returned": 1.0, "field": ".price", "raw_ref": None,
+                     "response_digest": digest},
+        "truth": {"value": 2.0, "source": "ref", "deviation": "+0 USD",
+                  "tolerance": "±1 USD", "dev_value": 0.0, "tol_value": 1.0, "unit": "USD"},
+        "verdict": {"status": "accurate", "why": "within tolerance of the primary source",
+                    "reverified": False, "decided_by": "single call",
+                    "method": "returned value vs a primary source, within a stated tolerance"},
+    }
+
+
+def test_digest_only_v2_rejects_hostile_payment_fields():
+    import receipts
+    base = _digest_only_v2_receipt()
+    check("digest-only v2 baseline ok", receipts.verify_receipt(base)["integrity"] is True)
+    bad_tx = json.loads(json.dumps(base))
+    bad_tx["payment"]["tx"] = "0xshort"
+    check("malformed added tx fails", receipts.verify_receipt(bad_tx)["integrity"] is False)
+    bad_chain = json.loads(json.dumps(base))
+    bad_chain["payment"]["chain"] = "ethereum"
+    check("wrong chain fails", receipts.verify_receipt(bad_chain)["integrity"] is False)
+
+
+def test_verify_receipt_rejects_v2_downgrade_with_digest():
+    import receipts
+    base = _digest_only_v2_receipt()
+    v2 = receipts.verify_receipt(base)
+    check("digest-bound v2 baseline integrity", v2["integrity"] is True)
+    check("digest-bound v2 baseline verdict", v2["verdict"] is True)
+    downgraded = json.loads(json.dumps(base))
+    downgraded["version"] = "1"
+    v = receipts.verify_receipt(downgraded)
+    check("v2->v1 downgrade does not throw", isinstance(v, dict))
+    check("v2->v1 downgrade integrity false", v["integrity"] is False)
+    check("v2->v1 downgrade response false", v["response"] is False)
+    check("v2->v1 downgrade verdict false", v["verdict"] is False)
+
+
+def test_verify_receipt_rejects_malformed_response_digest():
+    import receipts
+    base = _digest_only_v2_receipt()
+    check("valid lowercase digest baseline", receipts.verify_receipt(base)["integrity"] is True)
+    for val, label in (
+        ("x", "single char"),
+        (" " * 64, "64 spaces"),
+        ("g" * 64, "64 g chars"),
+        ("A" * 64, "uppercase hex"),
+        ("a" * 63, "short hex"),
+        ("a" * 65, "long hex"),
+        ([], "array digest"),
+        ({}, "object digest"),
+    ):
+        r = json.loads(json.dumps(base))
+        r["delivery"]["response_digest"] = val
+        v = receipts.verify_receipt(r)
+        check(f"{label} does not throw", isinstance(v, dict))
+        check(f"{label} integrity false", v["integrity"] is False)
+        check(f"{label} response false", v["response"] is False)
+        check(f"{label} verdict false", v["verdict"] is False)
+    v1 = _accuracy_v2(tx=None, paid=False)
+    check("valid v1 without digest preserved", receipts.verify_receipt(v1)["integrity"] is True)
+    settlement = _accuracy_v2()
+    check("valid settlement-bound v2 preserved", receipts.verify_receipt(settlement)["integrity"] is True)
+
+
+def test_archive_path_fail_closed_on_non_object_rows():
+    import receipts, tempfile, os, time
+    url = "https://feed.example/price"
+    stdout = json.dumps({"success": True, "data": {"price": 1},
+                         "metadata": {"payment": {"transactionHash": _FULL_TX}}})
+    with tempfile.TemporaryDirectory() as d:
+        name = f"raw_{time.strftime('%Y-%m-%d')}.jsonl"
+        path = os.path.join(d, name)
+        with open(path, "w") as fh:
+            fh.write(json.dumps("scalar-row") + "\n")
+            fh.write(json.dumps(["array-row"]) + "\n")
+            fh.write(json.dumps({"url": url, "stdout": stdout, "method": "GET"}) + "\n")
+        ref = {"capture": name, "line": 2, "match": {"url": url, "tx": _FULL_TX}}
+        hostile_ref = {"capture": name, "line": 0, "match": {"url": url, "tx": _FULL_TX}}
+        _orig = receipts.CAPTURES
+        try:
+            receipts.CAPTURES = d
+            idx = receipts.build_capture_index()
+            check("index skips non-object rows without error", isinstance(idx, dict))
+            check("scalar row not indexed", receipts.load_raw_stdout(hostile_ref) is None)
+            check("valid object row loads", receipts.load_raw_stdout(ref) is not None)
+        finally:
+            receipts.CAPTURES = _orig
+
+
+def test_archive_rejects_non_object_raw_ref_shapes():
+    import receipts
+    url = "https://feed.example/price"
+    for hostile, label in (("string-ref", "string raw_ref"),
+                           (["list-ref"], "list raw_ref"),
+                           ({"capture": "raw_2026-08-14.jsonl", "match": "bad"}, "string match"),
+                           ({"capture": "raw_2026-08-14.jsonl", "match": ["bad"]}, "list match")):
+        check(f"{label} load fails closed", receipts.load_raw_stdout(hostile) is None)
+    r = json.loads(json.dumps(_digest_only_v2_receipt()))
+    r["delivery"]["raw_ref"] = ["bad"]
+    out = receipts.verify_receipt(r)
+    check("verify on list raw_ref does not throw", isinstance(out, dict))
+    check("verify response false for hostile raw_ref", out["response"] is False)
+
+
+def _delivery_receipt_via_wrap():
+    import receipts
+    ev = receipts._evidence(
+        url="https://x.com/a", host="x.com",
+        quoted="0.001", charged="0.001", paid=True, free=False,
+        tx=_FULL_TX, promised=["a", "b"],
+        observed_schema={"a": "string"}, missing=[], extra=[],
+        status="delivered", why="ok")
+    return receipts._wrap(ev, kind="delivery", ts="2026-08-14", latency_ms=100, raw_ref=None)
+
+
+def test_verify_fail_closed_on_bad_accuracy_numeric_types():
+    import receipts
+    base = _digest_only_v2_receipt()
+    check("accuracy baseline verifies", receipts.verify_receipt(base)["integrity"] is True)
+
+    tol_none = json.loads(json.dumps(base))
+    tol_none["truth"]["tol_value"] = None
+    v = receipts.verify_receipt(tol_none)
+    check("tol_value None does not throw", isinstance(v, dict))
+    check("tol_value None fails verdict closed", v["verdict"] is False)
+
+    for label, patch, expect_verdict in (
+        ("dev_value string", {"dev_value": "0.0"}, False),
+        ("dev_value list", {"dev_value": []}, False),
+        ("tol_value string", {"tol_value": "1.0"}, False),
+        ("dev_value bool", {"dev_value": True}, False),
+        ("tol_value object", {"tol_value": {}}, False),
+    ):
+        r = json.loads(json.dumps(base))
+        r["truth"].update(patch)
+        out = receipts.verify_receipt(r)
+        check(f"{label} does not throw", isinstance(out, dict))
+        check(f"{label} fails verdict closed", out["verdict"] is expect_verdict)
+
+
+def test_verify_fail_closed_on_bad_delivery_collections_and_why():
+    import receipts
+    base = _delivery_receipt_via_wrap()
+    check("delivery baseline verifies", receipts.verify_receipt(base)["integrity"] is True)
+
+    fields_scalar = json.loads(json.dumps(base))
+    fields_scalar["promise"]["fields"] = 1
+    v = receipts.verify_receipt(fields_scalar)
+    check("promise.fields=1 does not throw", isinstance(v, dict))
+    check("promise.fields=1 fails integrity", v["integrity"] is False)
+    check("promise.fields=1 fails verdict closed", v["verdict"] is False)
+
+    for label, mutate, expect_integrity, expect_verdict in (
+        ("fields object", lambda r: r["promise"].update({"fields": {"a": 1}}), False, False),
+        ("fields null", lambda r: r["promise"].update({"fields": None}), False, True),
+        ("missing int", lambda r: r["delivery"].update({"missing": 1}), False, False),
+        ("missing string", lambda r: r["delivery"].update({"missing": "x"}), False, False),
+        ("missing null", lambda r: r["delivery"].update({"missing": None}), True, False),
+        ("extra int", lambda r: r["delivery"].update({"extra": 0}), False, False),
+        ("extra list of int", lambda r: r["delivery"].update({"extra": [1]}), False, False),
+        ("why int", lambda r: r["verdict"].update({"why": 1}), False, False),
+        ("why list", lambda r: r["verdict"].update({"why": []}), False, False),
+        ("why null", lambda r: r["verdict"].update({"why": None}), False, False),
+    ):
+        r = json.loads(json.dumps(base))
+        mutate(r)
+        out = receipts.verify_receipt(r)
+        check(f"{label} does not throw", isinstance(out, dict))
+        check(f"{label} integrity", out["integrity"] is expect_integrity)
+        if expect_verdict is not None:
+            check(f"{label} verdict", out["verdict"] is expect_verdict)
+
+
+def test_evidence_of_fail_closed_on_bad_collection_types():
+    import receipts
+    base = _delivery_receipt_via_wrap()
+    check("valid delivery evidence rebuilds", receipts.evidence_of(base) is not None)
+    for label, path, hostile in (
+        ("promise.fields scalar", ("promise", "fields"), 1),
+        ("delivery.missing object", ("delivery", "missing"), {}),
+        ("delivery.extra null element", ("delivery", "extra"), [None]),
+        ("verdict.why int", ("verdict", "why"), 0),
+    ):
+        r = json.loads(json.dumps(base))
+        r[path[0]][path[1]] = hostile
+        check(f"{label} evidence_of returns None", receipts.evidence_of(r) is None)
+
+
+def test_capture_exact_tx_not_url_last_wins():
+    import receipts, conform, tempfile
+    url = "https://feed.example/price"
+    tx_a, tx_b = _FULL_TX, _OTHER_TX
+    out_a = json.dumps({"success": True, "data": {"price": 1},
+                        "metadata": {"payment": {"transactionHash": tx_a}}})
+    out_b = json.dumps({"success": True, "data": {"price": 9},
+                        "metadata": {"payment": {"transactionHash": tx_b}}})
+    with tempfile.TemporaryDirectory() as d:
+        conform.archive_raw(url, "GET", None, 0, out_a, "", out_dir=d)
+        conform.archive_raw(url, "GET", None, 0, out_b, "", out_dir=d)
+        _orig = receipts.CAPTURES
+        try:
+            receipts.CAPTURES = d
+            idx = receipts.build_capture_index()
+            r = receipts._accuracy_receipt(
+                host="feed.example", url=url, quoted="0.001", paid=True,
+                metric="BTC/USD", returned=1.0, truth=2.0, source="ref",
+                dev_value=0.0, tol_value=1.0, unit="USD", field=".price",
+                ts="2026-08-14", cap_index=idx, tx=tx_a)
+            v = receipts.verify_receipt(r)
+        finally:
+            receipts.CAPTURES = _orig
+    check("explicit tx selects first capture not last", r["payment"]["tx"] == tx_a)
+    check("digest matches first call stdout", v["response"] is True)
+    check("explicit tx receipt self-consistent", v["integrity"] is True)
+
+
+def test_capture_rejects_ambiguous_same_url_no_tx():
+    import receipts, conform, tempfile, os
+    url = "https://feed.example/price"
+    with tempfile.TemporaryDirectory() as d:
+        conform.archive_raw(url, "GET", None, 0, "{}", "", out_dir=d)
+        conform.archive_raw(url, "GET", None, 0, "{}", "", out_dir=d)
+        cap = os.path.join(d, [f for f in os.listdir(d) if f.startswith("raw_")][0])
+        ref = {"capture": os.path.basename(cap), "match": {"url": url, "tx": None}}
+        _orig = receipts.CAPTURES
+        try:
+            receipts.CAPTURES = d
+            got = receipts.load_raw_stdout(ref)
+        finally:
+            receipts.CAPTURES = _orig
+    check("null tx never resolves a capture", got is None)
+
+
+def test_capture_wrong_line_and_mismatched_tx():
+    import receipts, tempfile
+    url = "https://feed.example/price"
+    stdout = json.dumps({"success": True, "data": {"price": 1},
+                         "metadata": {"payment": {"transactionHash": _FULL_TX}}})
+    with tempfile.TemporaryDirectory() as d:
+        ref = _archive_pair(url, _FULL_TX, stdout, d)
+        bad_line = dict(ref)
+        bad_line["line"] = 99
+        bad_tx = dict(ref)
+        bad_tx["match"] = {"url": url, "tx": _OTHER_TX}
+        _orig = receipts.CAPTURES
+        try:
+            receipts.CAPTURES = d
+            check("wrong line rejected", receipts.load_raw_stdout(bad_line) is None)
+            check("mismatched tx rejected", receipts.load_raw_stdout(bad_tx) is None)
+            for bad, label in (("0", "string"), (0.2, "float"), (True, "bool"),
+                               (-1, "negative int"), (-0.2, "negative float")):
+                hostile = dict(ref)
+                hostile["line"] = bad
+                check(f"line {label!r} rejected", receipts.load_raw_stdout(hostile) is None)
+        finally:
+            receipts.CAPTURES = _orig
+
+
+def test_capture_duplicate_same_identity_quarantined():
+    import receipts, conform, tempfile
+    url = "https://feed.example/price"
+    out1 = json.dumps({"success": True, "data": {"price": 1},
+                       "metadata": {"payment": {"transactionHash": _FULL_TX}}})
+    out2 = json.dumps({"success": True, "data": {"price": 9},
+                       "metadata": {"payment": {"transactionHash": _FULL_TX}}})
+    with tempfile.TemporaryDirectory() as d:
+        conform.archive_raw(url, "GET", None, 0, out1, "", out_dir=d)
+        conform.archive_raw(url, "GET", None, 0, out2, "", out_dir=d)
+        _orig = receipts.CAPTURES
+        try:
+            receipts.CAPTURES = d
+            idx = receipts.build_capture_index()
+            r = receipts._accuracy_receipt(
+                host="feed.example", url=url, quoted="0.001", paid=True,
+                metric="BTC/USD", returned=1.0, truth=2.0, source="ref",
+                dev_value=0.0, tol_value=1.0, unit="USD", field=".price",
+                ts="2026-08-14", cap_index=idx, tx=_FULL_TX)
+        finally:
+            receipts.CAPTURES = _orig
+    check("duplicate url+tx omitted from index", (url, _FULL_TX) not in idx)
+    check("duplicate identity binds no digest", r["delivery"].get("response_digest") is None)
+    check("duplicate identity leaves raw_ref unknown", r["delivery"].get("raw_ref") is None)
+
+
+def test_capture_symlink_rejected():
+    import receipts, conform, tempfile, os
+    url = "https://feed.example/price"
+    stdout = json.dumps({"success": True, "data": {"price": 1},
+                         "metadata": {"payment": {"transactionHash": _FULL_TX}}})
+    with tempfile.TemporaryDirectory() as d:
+        conform.archive_raw(url, "GET", None, 0, stdout, "", out_dir=d)
+        real = os.path.join(d, [f for f in os.listdir(d) if f.startswith("raw_")][0])
+        link = os.path.join(d, "raw_2026-08-15.jsonl")
+        if os.path.exists(link):
+            os.remove(link)
+        os.symlink(real, link)
+        ref = {"capture": "raw_2026-08-15.jsonl", "line": 0,
+               "match": {"url": url, "tx": _FULL_TX}}
+        _orig = receipts.CAPTURES
+        try:
+            receipts.CAPTURES = d
+            check("symlink capture path blocked", receipts._safe_capture_path("raw_2026-08-15.jsonl") is None)
+            check("symlink capture load fails closed", receipts.load_raw_stdout(ref) is None)
+            check("index resolves regular file not symlink name",
+                  receipts.load_raw_stdout({"capture": os.path.basename(real), "line": 0,
+                                            "match": {"url": url, "tx": _FULL_TX}}) is not None)
+        finally:
+            receipts.CAPTURES = _orig
+
+
+def test_capture_path_traversal_blocked():
+    import receipts, tempfile, os
+    url = "https://feed.example/price"
+    stdout = json.dumps({"success": True, "data": {}, "metadata": {
+        "payment": {"transactionHash": _FULL_TX}}})
+    with tempfile.TemporaryDirectory() as d:
+        ref = _archive_pair(url, _FULL_TX, stdout, d)
+        base = ref["capture"]
+        _orig = receipts.CAPTURES
+        try:
+            receipts.CAPTURES = d
+            for hostile, label in (
+                ("/etc/passwd", "absolute"),
+                ("../outside.jsonl", "traversal"),
+                ("nested/raw_2026-08-14.jsonl", "nested"),
+                ("raw_evil.jsonl", "bad name"),
+            ):
+                bad = dict(ref)
+                bad["capture"] = hostile if hostile != "nested/raw_2026-08-14.jsonl" else base.replace(
+                    "raw_", "nested/raw_")
+                if hostile == "nested/raw_2026-08-14.jsonl":
+                    bad["capture"] = "sub/raw_2026-08-14.jsonl"
+                check(f"{label} capture path blocked", receipts.load_raw_stdout(bad) is None)
+        finally:
+            receipts.CAPTURES = _orig
+
+
+def test_accuracy_without_matching_capture_has_no_digest():
+    import receipts
+    url = "https://feed.example/price"
+    r = receipts._accuracy_receipt(
+        host="feed.example", url=url, quoted="0.001", paid=True,
+        metric="BTC/USD", returned=1.0, truth=2.0, source="ref",
+        dev_value=0.0, tol_value=1.0, unit="USD", field=".price",
+        ts="2026-08-14", cap_index={}, tx=_FULL_TX)
+    check("missing capture leaves digest unknown", r["delivery"].get("response_digest") is None)
+    check("settlement still bound when tx known", r["version"] == "2" and r["payment"]["tx"] == _FULL_TX)
+    check("missing capture self-consistent", receipts.verify_receipt(r)["integrity"] is True)
 
 # --- Preflight verdict: the pre-payment oracle -------------------------------
 # The highest-stakes logic on the site: a red verdict is a public "do not pay

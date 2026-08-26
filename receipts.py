@@ -33,6 +33,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import sys
 
 import conform
@@ -44,6 +45,11 @@ RECEIPTS_DIR = os.path.join(DATA, "receipts")
 RECEIPTS = os.path.join(RECEIPTS_DIR, "receipts.jsonl")
 SUMMARY = os.path.join(RECEIPTS_DIR, "summary.json")
 VERSION = "1"
+VERSION_BOUND = "2"   # binds settlement identity and/or archived agentcash stdout
+SUPPORTED_VERSIONS = frozenset({VERSION, VERSION_BOUND})
+CHAIN_CANON = "base"
+CAPTURE_NAME_RE = re.compile(r"^raw_\d{4}-\d{2}-\d{2}\.jsonl$")
+RESPONSE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 # ---- coercion: the conformance record stores some fields as strings -----------
@@ -64,6 +70,35 @@ def _i(v):
         return None
 
 
+def _str_list(val):
+    """Exact list of strings for hashed field lists; None if wrong type."""
+    if val is None:
+        return []
+    if not isinstance(val, list):
+        return None
+    if not all(isinstance(x, str) for x in val):
+        return None
+    return sorted(val)
+
+
+def _compare_float(val):
+    """Numeric value for tolerance math; None if not a real number."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    return None
+
+
+def _why_str(val):
+    """Verdict why text; empty string if absent, None if wrong type."""
+    if val is None:
+        return ""
+    if not isinstance(val, str):
+        return None
+    return val
+
+
 def _canon(x):
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -71,6 +106,150 @@ def _canon(x):
 def content_id(ev):
     """Stable, tamper-evident id: a sha256 over the canonicalised evidence."""
     return "wab_" + hashlib.sha256(_canon(ev).encode()).hexdigest()[:16]
+
+
+def _normalize_tx(tx):
+    """Canonical Base settlement id: lowercase 0x plus 64 hex digits, or None."""
+    if not tx or not isinstance(tx, str):
+        return None
+    t = tx.strip().lower()
+    if not t.startswith("0x") or len(t) != 66:
+        return None
+    try:
+        int(t[2:], 16)
+    except ValueError:
+        return None
+    return t
+
+
+def _parse_version(receipt):
+    """Exact supported version string only; no trim or coercion."""
+    if not isinstance(receipt, dict):
+        return None
+    if "version" not in receipt:
+        return VERSION
+    v = receipt.get("version")
+    if v is None or isinstance(v, bool):
+        return None
+    if not isinstance(v, str):
+        return None
+    if v not in SUPPORTED_VERSIONS:
+        return None
+    return v
+
+
+def _valid_response_digest(digest):
+    """Exact archived stdout digest contract: lowercase 64-char SHA-256 hex."""
+    return isinstance(digest, str) and bool(RESPONSE_DIGEST_RE.match(digest))
+
+
+def _digest_claimed(receipt):
+    d = (receipt.get("delivery") if isinstance(receipt, dict) else None) or {}
+    return _valid_response_digest(d.get("response_digest"))
+
+
+def _digest_field_present(receipt):
+    d = (receipt.get("delivery") if isinstance(receipt, dict) else None) or {}
+    return "response_digest" in d and d["response_digest"] is not None
+
+
+def _digest_forbidden(receipt, ver):
+    """v1 must not carry response_digest; v2 rejects non-contract digest values."""
+    if ver not in SUPPORTED_VERSIONS:
+        return _digest_field_present(receipt)
+    if not _digest_field_present(receipt):
+        return False
+    digest = (((receipt.get("delivery") if isinstance(receipt, dict) else None) or {})
+              .get("response_digest"))
+    if ver == VERSION:
+        return True
+    return not _valid_response_digest(digest)
+
+
+def _v2_incoherent(receipt, ver):
+    """v2 must carry a real binding; presentation fields must normalize exactly."""
+    if ver != VERSION_BOUND:
+        return False
+    payment = receipt.get("payment")
+    delivery = receipt.get("delivery")
+    if not isinstance(payment, dict) or not isinstance(delivery, dict):
+        return True
+    tx_raw = payment.get("tx")
+    chain_raw = payment.get("chain")
+    ntx = _normalize_tx(tx_raw) if tx_raw is not None else None
+    nch = _normalize_chain(chain_raw) if chain_raw is not None else None
+    has_digest = _digest_claimed(receipt)
+    has_settlement = ntx is not None and nch == CHAIN_CANON
+    if not has_digest and not has_settlement:
+        return True
+    if tx_raw is not None and ntx is None:
+        return True
+    if chain_raw is not None and nch is None:
+        return True
+    if has_settlement and nch != CHAIN_CANON:
+        return True
+    return False
+
+
+def _normalize_chain(chain):
+    """Canonical settlement network for Base mainnet USDC, or None if unknown."""
+    if not chain or not isinstance(chain, str):
+        return None
+    c = chain.strip().lower()
+    if c in ("base", "eip155:8453", "8453"):
+        return CHAIN_CANON
+    return None
+
+
+def _safe_capture_path(basename):
+    """Resolve a regular, non-symlink capture file under CAPTURES/."""
+    if not basename or not isinstance(basename, str):
+        return None
+    name = basename.replace("\\", "/")
+    if name.startswith("/") or ".." in name.split("/"):
+        return None
+    if "/" in name or name.startswith("."):
+        return None
+    if name != os.path.basename(name):
+        return None
+    if not CAPTURE_NAME_RE.match(name):
+        return None
+    path = os.path.join(CAPTURES, name)
+    root = os.path.realpath(CAPTURES)
+    if os.path.islink(path):
+        return None
+    if not os.path.isfile(path):
+        return None
+    real_path = os.path.realpath(path)
+    if not real_path.startswith(root + os.sep):
+        return None
+    return path
+
+
+def _parse_line_no(line):
+    """Exact non-negative int line index only; no bool/str/float coercion."""
+    if type(line) is not int:
+        return None
+    if line < 0:
+        return None
+    return line
+
+
+def _response_digest(raw_ref):
+    """sha256 over the UTF-8 encoding of the exact archived agentcash stdout string."""
+    stdout = load_raw_stdout(raw_ref)
+    if stdout is None:
+        return None
+    return hashlib.sha256(stdout.encode("utf-8")).hexdigest()
+
+
+def _receipt_version(ev):
+    """v2 when settlement identity (tx+chain) and/or stdout digest is bound."""
+    if ev.get("response_digest"):
+        return VERSION_BOUND
+    if ev.get("tx") is not None and ev.get("chain") is not None:
+        return VERSION_BOUND
+    return VERSION
 
 
 def _logical_key(receipt):
@@ -86,46 +265,60 @@ def _logical_key(receipt):
 # (timestamps, latency, source labels) is deliberately left out of the hash.
 def _evidence(url, host, quoted, charged, paid, free, tx,
               promised, observed_schema, missing, extra, status, why):
+    pl = _str_list(promised)
+    mi = _str_list(missing)
+    ex = _str_list(extra)
+    ws = _why_str(why)
+    if pl is None or mi is None or ex is None or ws is None:
+        return None
     return {
         "url": url, "host": host,
         "quoted": _s(quoted), "charged": _s(charged),
-        "paid": _b(paid), "free": _b(free), "tx": tx or None,
-        "promised": sorted(promised or []),
+        "paid": _b(paid), "free": _b(free),
+        "tx": _normalize_tx(tx) if tx else None,
+        "promised": pl,
         "observed_schema": observed_schema,
-        "missing": sorted(missing or []), "extra": sorted(extra or []),
-        "status": status, "why": why or "",
+        "missing": mi, "extra": ex,
+        "status": status, "why": ws,
     }
 
 
 def _wrap(ev, *, kind, ts, latency_ms, raw_ref, truth=None):
     """Assemble the human- and machine-readable receipt around hashed evidence."""
-    rid = content_id(ev)
-    reverified = ev["why"] == "shortfall confirmed on two calls"
-    two_call = reverified or "re-verify" in (ev["why"] or "")
+    ev_h = dict(ev)
+    if ev_h.get("tx") and not ev_h.get("chain"):
+        ev_h["chain"] = CHAIN_CANON
+    digest = _response_digest(raw_ref) if raw_ref else None
+    if digest:
+        ev_h["response_digest"] = digest
+    rid = content_id(ev_h)
+    reverified = ev_h["why"] == "shortfall confirmed on two calls"
+    two_call = reverified or "re-verify" in (ev_h["why"] or "")
     r = {
         "receipt_id": rid,
-        "version": VERSION,
+        "version": _receipt_version(ev_h),
         "kind": kind,                       # delivery (field-presence) | accuracy
         "ts": ts or "",
-        "seller": {"host": ev["host"], "url": ev["url"]},
+        "seller": {"host": ev_h["host"], "url": ev_h["url"]},
         "promise": {
-            "price_usdc": ev["quoted"],
-            "fields": ev["promised"],
+            "price_usdc": ev_h["quoted"],
+            "fields": ev_h["promised"],
             "source": "x402 Bazaar (CDP discovery)",
         },
         "payment": {
-            "charged_usdc": ev["charged"], "paid": ev["paid"], "free": ev["free"],
-            "tx": ev["tx"], "chain": "base",
+            "charged_usdc": ev_h["charged"], "paid": ev_h["paid"], "free": ev_h["free"],
+            "tx": ev_h["tx"], "chain": CHAIN_CANON,
             "settlement": "EIP-3009, submitted by a facilitator",
         },
         "delivery": {
             "latency_ms": latency_ms,
-            "observed_schema": ev["observed_schema"],
-            "missing": ev["missing"], "extra": ev["extra"],
+            "observed_schema": ev_h["observed_schema"],
+            "missing": ev_h["missing"], "extra": ev_h["extra"],
             "raw_ref": raw_ref,             # pointer into captures/, never the goods
+            **({"response_digest": digest} if digest else {}),
         },
         "verdict": {
-            "status": ev["status"], "why": ev["why"],
+            "status": ev_h["status"], "why": ev_h["why"],
             "reverified": reverified,
             "decided_by": "two-call reconcile" if two_call else "single call",
             "method": "field-presence vs promised (conform.judge)",
@@ -173,31 +366,39 @@ def _num(x):
 
 
 def _accuracy_receipt(*, host, url, quoted, paid, metric, returned, truth,
-                      source, dev_value, tol_value, unit, field, ts, url_index,
-                      note=None):
+                      source, dev_value, tol_value, unit, field, ts, cap_index,
+                      tx=None, note=None):
     status = ("inconclusive" if returned is None
               else "accurate" if (dev_value is not None and abs(dev_value) <= tol_value)
               else "off")
+    ntx = _normalize_tx(tx)
+    ref = cap_index.get((url, ntx)) if (cap_index is not None and ntx) else None
+    digest = _response_digest(ref) if ref else None
     ev = {
         "url": url, "host": host, "quoted": _s(quoted), "paid": _b(paid),
         "metric": metric, "returned": returned, "truth": truth,
         "truth_source": source, "dev_value": dev_value, "tol_value": tol_value,
         "unit": unit, "field": field, "status": status,
     }
+    if ntx:
+        ev["tx"] = ntx
+        ev["chain"] = CHAIN_CANON
+    if digest:
+        ev["response_digest"] = digest
     rid = content_id(ev)
-    ref = (url_index or {}).get(url)
     dev_str = None if dev_value is None else f"{dev_value:+g} {unit}"
     return {
-        "receipt_id": rid, "version": VERSION, "kind": "accuracy", "ts": ts or "",
+        "receipt_id": rid, "version": _receipt_version(ev), "kind": "accuracy", "ts": ts or "",
         "seller": {"host": host, "url": url},
         "promise": {"price_usdc": _s(quoted), "metric": metric,
                     "source": "x402 Bazaar (CDP discovery)"},
         "payment": {"charged_usdc": _s(quoted) if _b(paid) else "0",
                     "paid": _b(paid), "free": not _b(paid),
-                    "tx": (ref or {}).get("tx"), "chain": "base",
+                    "tx": ntx, "chain": CHAIN_CANON,
                     "settlement": "EIP-3009, submitted by a facilitator"},
         "delivery": {"returned": returned, "field": field,
-                     "raw_ref": ref},
+                     "raw_ref": ref,
+                     **({"response_digest": digest} if digest else {})},
         "truth": {"value": truth, "source": source, "deviation": dev_str,
                   "tolerance": f"±{tol_value:g} {unit}",
                   "dev_value": dev_value, "tol_value": tol_value, "unit": unit},
@@ -216,7 +417,7 @@ def _accuracy_receipt(*, host, url, quoted, paid, metric, returned, truth,
     }
 
 
-def receipts_from_price(url_index):
+def receipts_from_price(cap_index):
     p = os.path.join(DATA, "price_shootout.json")
     if not os.path.exists(p):
         return []
@@ -243,11 +444,11 @@ def receipts_from_price(url_index):
             source=f"median of {srcs}",
             dev_value=(None if bad_field else _num(r.get("dev_bps"))),
             tol_value=50.0, unit="bps", field=r.get("field"),
-            ts=d.get("generated", "")[:10], url_index=url_index, note=note))
+            ts=d.get("generated", "")[:10], cap_index=cap_index, note=note))
     return out
 
 
-def receipts_from_balance(url_index):
+def receipts_from_balance(cap_index):
     p = os.path.join(DATA, "balance_shootout.json")
     if not os.path.exists(p):
         return []
@@ -265,11 +466,11 @@ def receipts_from_balance(url_index):
             returned=_num(r.get("usdc")), truth=truth,
             source="Base chain balanceOf (latest block)",
             dev_value=_num(r.get("dev")), tol_value=0.01, unit="USDC",
-            field=".usdc", ts=d.get("generated", "")[:10], url_index=url_index))
+            field=".usdc", ts=d.get("generated", "")[:10], cap_index=cap_index))
     return out
 
 
-def receipts_from_stock(url_index):
+def receipts_from_stock(cap_index):
     p = os.path.join(DATA, "stock_shootout.json")
     if not os.path.exists(p):
         return []
@@ -286,11 +487,11 @@ def receipts_from_stock(url_index):
             returned=_num(r.get("price")), truth=truth,
             source="FMP real-time quote", dev_value=_num(r.get("dev_bps")),
             tol_value=50.0, unit="bps", field=r.get("field"),
-            ts=d.get("generated", "")[:10], url_index=url_index))
+            ts=d.get("generated", "")[:10], cap_index=cap_index))
     return out
 
 
-def receipts_from_lab(url_index):
+def receipts_from_lab(cap_index):
     """Accuracy receipts from the daily lab (lab.json), which grades every
     accuracy category against its primary source. This is the corpus feed; the
     per-shootout adapters above are the legacy single-category path."""
@@ -315,85 +516,147 @@ def receipts_from_lab(url_index):
                 returned=_num(r.get("value")), truth=truth,
                 source=c.get("source", ""), dev_value=_num(r.get("dev")),
                 tol_value=c.get("tol", 100.0), unit=c.get("unit", ""),
-                field=r.get("field"), ts=ts, url_index=url_index))
+                field=r.get("field"), ts=ts, cap_index=cap_index,
+                tx=r.get("tx")))
     return out
 
 
 # ---- capture index: locate the archived raw bytes for a receipt ---------------
 def _tx_of(stdout):
+    if not isinstance(stdout, str):
+        return None
     try:
         env = json.loads(stdout)
-        pay = (env.get("metadata") or {}).get("payment") or {}
-        return pay.get("transactionHash")
-    except (ValueError, AttributeError):
+    except ValueError:
         return None
+    if not isinstance(env, dict):
+        return None
+    meta = env.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    pay = meta.get("payment")
+    if not isinstance(pay, dict):
+        return None
+    return pay.get("transactionHash")
 
 
 def build_capture_index():
-    """Map (url, tx) -> a pointer into captures/, so a receipt can name the exact
-    archived response an auditor should re-derive its shape from."""
-    idx = {}
+    """Map (url, normalized tx) -> capture pointer only when identity is unique."""
+    pending = {}
     for f in sorted(glob.glob(os.path.join(CAPTURES, "raw_*.jsonl"))):
-        base = os.path.basename(f)
-        with open(f) as fh:
+        path = _safe_capture_path(os.path.basename(f))
+        if not path:
+            continue
+        base = os.path.basename(path)
+        with open(path) as fh:
             for n, line in enumerate(fh):
                 try:
                     rec = json.loads(line)
                 except ValueError:
                     continue
-                key = (rec.get("url"), _tx_of(rec.get("stdout", "")))
-                if key[0] and key not in idx:      # first occurrence wins
-                    idx[key] = {"capture": base, "line": n,
-                                "match": {"url": key[0], "tx": key[1]}}
-    return idx
-
-
-def build_url_index():
-    """Map url -> a capture pointer (with its tx), last occurrence winning, so an
-    accuracy row that carries no per-call tx can still be tied to the on-chain
-    payment and the archived bytes."""
-    idx = {}
-    for f in sorted(glob.glob(os.path.join(CAPTURES, "raw_*.jsonl"))):
-        base = os.path.basename(f)
-        with open(f) as fh:
-            for n, line in enumerate(fh):
-                try:
-                    rec = json.loads(line)
-                except ValueError:
+                if not isinstance(rec, dict):
                     continue
                 url = rec.get("url")
-                if not url:
+                if not isinstance(url, str):
                     continue
-                tx = _tx_of(rec.get("stdout", ""))
-                idx[url] = {"capture": base, "line": n,
-                            "match": {"url": url, "tx": tx}, "tx": tx}
-    return idx
+                ntx = _normalize_tx(_tx_of(rec.get("stdout", "")))
+                if not url or not ntx:
+                    continue
+                key = (url, ntx)
+                pending.setdefault(key, []).append(
+                    {"capture": base, "line": n,
+                     "match": {"url": url, "tx": ntx}})
+    return {k: refs[0] for k, refs in pending.items() if len(refs) == 1}
+
+
+def _line_record(path, line_no):
+    line_no = _parse_line_no(line_no)
+    if line_no is None:
+        return None
+    with open(path) as fh:
+        for n, line in enumerate(fh):
+            if n == line_no:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    return None
+                return rec if isinstance(rec, dict) else None
+    return None
+
+
+def _scan_exact_url_tx(path, url, want_tx):
+    """All lines in one file matching url+tx. None if not exactly one."""
+    matches = []
+    with open(path) as fh:
+        for n, line in enumerate(fh):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("url") != url:
+                continue
+            got_tx = _normalize_tx(_tx_of(rec.get("stdout", "")))
+            if got_tx == want_tx:
+                matches.append(rec)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _capture_match(raw_ref):
+    """Locate archived stdout by safe capture name, exact line, and url+tx identity."""
+    if not isinstance(raw_ref, dict):
+        return None
+    path = _safe_capture_path(raw_ref.get("capture"))
+    if not path:
+        return None
+    m = raw_ref.get("match")
+    if not isinstance(m, dict):
+        return None
+    url = m.get("url")
+    if not isinstance(url, str):
+        return None
+    want_tx = _normalize_tx(m.get("tx"))
+    if not url or not want_tx:
+        return None
+
+    if "line" in raw_ref:
+        line_no = _parse_line_no(raw_ref.get("line"))
+        if line_no is None:
+            return None
+        rec = _line_record(path, line_no)
+        if not isinstance(rec, dict):
+            return None
+        if rec.get("url") != url:
+            return None
+        if _normalize_tx(_tx_of(rec.get("stdout", ""))) != want_tx:
+            return None
+        return rec
+
+    return _scan_exact_url_tx(path, url, want_tx)
+
+
+def load_raw_stdout(raw_ref):
+    """Exact agentcash stdout archived at pay time, before any parse."""
+    rec = _capture_match(raw_ref)
+    if not rec:
+        return None
+    stdout = rec.get("stdout")
+    return stdout if isinstance(stdout, str) else None
 
 
 def load_raw_payload(raw_ref):
     """Pull the seller's untouched response data from captures/, matched by
     url+tx (not a fragile line number). Returns the parsed data, or None."""
-    if not raw_ref:
+    stdout = load_raw_stdout(raw_ref)
+    if stdout is None:
         return None
-    m = raw_ref.get("match", {})
-    path = os.path.join(CAPTURES, raw_ref.get("capture", ""))
-    if not os.path.exists(path):
+    try:
+        return json.loads(stdout).get("data")
+    except (ValueError, KeyError):
         return None
-    with open(path) as fh:
-        for line in fh:
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if rec.get("url") != m.get("url"):
-                continue
-            if _tx_of(rec.get("stdout", "")) != m.get("tx"):
-                continue
-            try:
-                return json.loads(rec["stdout"]).get("data")
-            except (ValueError, KeyError):
-                return None
-    return None
 
 
 # ---- verification: the trustless core -----------------------------------------
@@ -415,68 +678,158 @@ def schema_probe(schema):
     return None                                          # a scalar leaf -> non-dict
 
 
-def evidence_of(receipt):
+def evidence_of(receipt, ver=None):
     """Reconstruct the hashed evidence from a stored receipt, so anyone can
     recompute the id and confirm nothing was altered."""
-    if receipt["kind"] == "accuracy":
-        t = receipt["truth"]
-        return {
-            "url": receipt["seller"]["url"], "host": receipt["seller"]["host"],
-            "quoted": receipt["promise"]["price_usdc"],
-            "paid": receipt["payment"]["paid"],
-            "metric": receipt["promise"]["metric"],
-            "returned": receipt["delivery"]["returned"], "truth": t["value"],
-            "truth_source": t["source"], "dev_value": t["dev_value"],
-            "tol_value": t["tol_value"], "unit": t["unit"],
-            "field": receipt["delivery"]["field"],
-            "status": receipt["verdict"]["status"],
+    if not isinstance(receipt, dict):
+        return None
+    ver = ver if ver is not None else _parse_version(receipt)
+    if ver is None:
+        return None
+    kind = receipt.get("kind")
+    delivery = receipt.get("delivery")
+    if not isinstance(delivery, dict):
+        return None
+    digest = delivery.get("response_digest")
+    if kind == "accuracy":
+        truth = receipt.get("truth")
+        seller = receipt.get("seller")
+        promise = receipt.get("promise")
+        payment = receipt.get("payment")
+        verdict = receipt.get("verdict")
+        if not all(isinstance(x, dict) for x in (truth, seller, promise, payment, verdict)):
+            return None
+        ev = {
+            "url": seller.get("url"), "host": seller.get("host"),
+            "quoted": promise.get("price_usdc"),
+            "paid": payment.get("paid"),
+            "metric": promise.get("metric"),
+            "returned": delivery.get("returned"), "truth": truth.get("value"),
+            "truth_source": truth.get("source"), "dev_value": truth.get("dev_value"),
+            "tol_value": truth.get("tol_value"), "unit": truth.get("unit"),
+            "field": delivery.get("field"),
+            "status": verdict.get("status"),
         }
-    return _evidence(
-        url=receipt["seller"]["url"], host=receipt["seller"]["host"],
-        quoted=receipt["promise"]["price_usdc"],
-        charged=receipt["payment"]["charged_usdc"],
-        paid=receipt["payment"]["paid"], free=receipt["payment"]["free"],
-        tx=receipt["payment"]["tx"], promised=receipt["promise"]["fields"],
-        observed_schema=receipt["delivery"]["observed_schema"],
-        missing=receipt["delivery"]["missing"], extra=receipt["delivery"]["extra"],
-        status=receipt["verdict"]["status"], why=receipt["verdict"]["why"],
+        if ver == VERSION_BOUND:
+            ntx = _normalize_tx(payment.get("tx"))
+            if ntx:
+                ev["tx"] = ntx
+                nch = _normalize_chain(payment.get("chain"))
+                if nch:
+                    ev["chain"] = nch
+        if ver == VERSION_BOUND and _valid_response_digest(digest):
+            ev["response_digest"] = digest
+        return ev
+    seller = receipt.get("seller")
+    promise = receipt.get("promise")
+    payment = receipt.get("payment")
+    verdict = receipt.get("verdict")
+    if not all(isinstance(x, dict) for x in (seller, promise, payment, verdict)):
+        return None
+    ev = _evidence(
+        url=seller.get("url"), host=seller.get("host"),
+        quoted=promise.get("price_usdc"),
+        charged=payment.get("charged_usdc"),
+        paid=payment.get("paid"), free=payment.get("free"),
+        tx=payment.get("tx"), promised=promise.get("fields"),
+        observed_schema=delivery.get("observed_schema"),
+        missing=delivery.get("missing"), extra=delivery.get("extra"),
+        status=verdict.get("status"), why=verdict.get("why"),
     )
+    if ev is None:
+        return None
+    if ver == VERSION_BOUND:
+        ntx = _normalize_tx(payment.get("tx"))
+        if ntx:
+            nch = _normalize_chain(payment.get("chain"))
+            if nch:
+                ev["chain"] = nch
+        if _valid_response_digest(digest):
+            ev["response_digest"] = digest
+    return ev
 
 
 def verify_receipt(receipt):
     """Re-derive the receipt at all three levels. Returns a dict of pass/None
     (None = not checkable here, e.g. no archived raw for this call)."""
-    out = {}
-    # 1. integrity: the id is a faithful hash of the evidence
-    out["integrity"] = content_id(evidence_of(receipt)) == receipt["receipt_id"]
-    # 2. verdict: re-judge the saved response shape against the promise, offline.
-    #    A verdict decided by the two-call reconcile cannot be reproduced from one
-    #    stored shape, so it is honestly n/a here (the raw level still checks it).
-    if receipt["kind"] == "accuracy":
-        # verdict re-derives arithmetically: is |deviation| within tolerance?
-        t = receipt["truth"]
-        ret = receipt["delivery"]["returned"]
-        expect = ("inconclusive" if ret is None
-                  else "accurate" if (t["dev_value"] is not None
-                                      and abs(t["dev_value"]) <= t["tol_value"])
-                  else "off")
-        out["verdict"] = expect == receipt["verdict"]["status"]
-        out["raw"] = None            # field re-extraction from raw: Phase 2.5
+    out = {"integrity": False, "response": None, "verdict": None, "raw": None}
+    if not isinstance(receipt, dict):
         return out
-    reconciled = "re-verify" in (receipt["verdict"].get("why") or "")
-    if not reconciled:
-        regraded = conform.judge(schema_probe(receipt["delivery"]["observed_schema"]),
-                                 receipt["promise"]["fields"])
-        out["verdict"] = regraded["status"] == receipt["verdict"]["status"]
+    ver = _parse_version(receipt)
+    if ver is None:
+        out["response"] = False if _digest_field_present(receipt) else None
+        return out
+    if _digest_forbidden(receipt, ver):
+        out["response"] = False
+        out["verdict"] = False
+        return out
+    if _v2_incoherent(receipt, ver):
+        out["response"] = False if _digest_field_present(receipt) else None
+        return out
+    ev = evidence_of(receipt, ver)
+    out["integrity"] = ev is not None and content_id(ev) == receipt.get("receipt_id")
+    delivery = receipt.get("delivery")
+    if not isinstance(delivery, dict):
+        out["response"] = False if _digest_field_present(receipt) else None
+        return out
+    digest = delivery.get("response_digest")
+    if digest is None:
+        out["response"] = None
+    elif not _valid_response_digest(digest):
+        out["response"] = False
     else:
-        out["verdict"] = None
-    # 3. raw: re-derive the shape from the untouched archived bytes
-    payload = load_raw_payload(receipt["delivery"].get("raw_ref"))
+        payment = receipt.get("payment") if isinstance(receipt.get("payment"), dict) else {}
+        raw_ref = delivery.get("raw_ref")
+        if raw_ref is not None and not isinstance(raw_ref, dict):
+            out["response"] = False
+        else:
+            pay_tx = _normalize_tx(payment.get("tx"))
+            ref_match = raw_ref.get("match") if isinstance(raw_ref, dict) else None
+            ref_tx = (_normalize_tx(ref_match.get("tx"))
+                      if isinstance(ref_match, dict) else None)
+            if pay_tx and ref_tx and pay_tx != ref_tx:
+                out["response"] = False
+            else:
+                got = _response_digest(raw_ref) if isinstance(raw_ref, dict) else None
+                out["response"] = (got == digest) if got is not None else None
+    if receipt.get("kind") == "accuracy":
+        truth = receipt.get("truth")
+        verdict = receipt.get("verdict")
+        if not isinstance(truth, dict) or not isinstance(verdict, dict):
+            return out
+        ret = delivery.get("returned")
+        dev = _compare_float(truth.get("dev_value"))
+        tol = _compare_float(truth.get("tol_value"))
+        if ret is None:
+            expect = "inconclusive"
+        elif dev is not None and tol is not None and abs(dev) <= tol:
+            expect = "accurate"
+        else:
+            expect = "off"
+        out["verdict"] = expect == verdict.get("status")
+        return out
+    promise = receipt.get("promise")
+    verdict = receipt.get("verdict")
+    if not isinstance(promise, dict) or not isinstance(verdict, dict):
+        return out
+    why = _why_str(verdict.get("why"))
+    if why is None:
+        out["verdict"] = False
+    elif "re-verify" not in why:
+        fields = _str_list(promise.get("fields"))
+        if fields is None:
+            out["verdict"] = False
+        else:
+            regraded = conform.judge(schema_probe(delivery.get("observed_schema")),
+                                     fields)
+            out["verdict"] = regraded["status"] == verdict.get("status")
+    raw_ref = delivery.get("raw_ref")
+    payload = load_raw_payload(raw_ref) if isinstance(raw_ref, dict) else None
     if payload is None:
         out["raw"] = None
     else:
         out["raw"] = (conform.describe_shape(payload)
-                      == receipt["delivery"]["observed_schema"])
+                      == delivery.get("observed_schema"))
     return out
 
 
@@ -506,7 +859,6 @@ def backfill():
     """Assemble receipts from every graded paid call we have, merge into the
     accumulating ledger (dedup by content id), and write a summary."""
     cap_index = build_capture_index()
-    url_index = build_url_index()
     ledger = load_ledger()
     before = len(ledger)
 
@@ -521,8 +873,8 @@ def backfill():
     with_raw = sum(1 for r in fresh if r["delivery"]["raw_ref"])
 
     # accuracy receipts: graded against a primary source (exchange median, chain)
-    acc = (receipts_from_price(url_index) + receipts_from_balance(url_index)
-           + receipts_from_stock(url_index) + receipts_from_lab(url_index))
+    acc = (receipts_from_price(cap_index) + receipts_from_balance(cap_index)
+           + receipts_from_stock(cap_index) + receipts_from_lab(cap_index))
     fresh += acc
     print(f"assembled {len(acc)} accuracy receipts (shootouts + daily lab) graded vs a primary source")
 
@@ -641,9 +993,10 @@ def main(argv):
         v = verify_receipt(r)
         print(f"receipt {r['receipt_id']}  ({r['seller']['host']}, verdict: {r['verdict']['status']})")
         names = {"integrity": "1. INTEGRITY (id is a faithful hash of the evidence)",
+                 "response": "1b.RESPONSE (archived agentcash stdout digest matches the binding)",
                  "verdict": "2. VERDICT   (re-judged offline, no network)",
                  "raw": "3. RAW       (shape re-derived from archived bytes)"}
-        for k in ("integrity", "verdict", "raw"):
+        for k in ("integrity", "response", "verdict", "raw"):
             mark = {True: "PASS", False: "FAIL", None: "n/a "}[v[k]]
             print(f"   [{mark}] {names[k]}")
         return
