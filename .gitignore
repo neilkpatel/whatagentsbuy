@@ -1,0 +1,17 @@
+# This public repo is the open methodology (code) only.
+# The accumulated data and the paid-response archive stay private; everything
+# they produce is published at whatagentsbuy.com.
+data/
+captures/
+public/
+
+# tooling / build noise
+__pycache__/
+*.pyc
+node_modules/
+bin/
+.DS_Store
+
+# never commit any key
+*.pem
+.env

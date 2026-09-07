@@ -1,0 +1,51 @@
+{
+ "buildCommand": null,
+ "outputDirectory": "public",
+ "framework": null,
+ "cleanUrls": true,
+ "trailingSlash": false,
+ "headers": [
+  {
+   "source": "/.well-known/x402",
+   "headers": [{ "key": "content-type", "value": "application/json; charset=utf-8" }]
+  },
+  {
+   "source": "/api/(.*).json",
+   "headers": [{ "key": "access-control-allow-origin", "value": "*" }]
+  }
+ ],
+ "rewrites": [
+  {
+   "source": "/x402/:fn",
+   "destination": "/api/x402/:fn"
+  },
+  {
+   "source": "/mcp",
+   "destination": "/api/mcp"
+  }
+ ],
+ "redirects": [
+  {
+   "source": "/",
+   "has": [
+    {
+     "type": "host",
+     "value": "www.whatagentsbuy.com"
+    }
+   ],
+   "destination": "https://whatagentsbuy.com/",
+   "permanent": true
+  },
+  {
+   "source": "/:path*",
+   "has": [
+    {
+     "type": "host",
+     "value": "www.whatagentsbuy.com"
+    }
+   ],
+   "destination": "https://whatagentsbuy.com/:path*",
+   "permanent": true
+  }
+ ]
+}
