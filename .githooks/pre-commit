@@ -1,0 +1,11 @@
+#!/bin/bash
+# Blocks any commit if the test suite is red. The overwrite/field-name/money bugs
+# that cost us this session were all catchable by tests; this makes green tests a
+# precondition for committing, not a thing anyone has to remember.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+echo "pre-commit: running tests.py ..."
+if ! python3 tests.py; then
+  echo ""
+  echo "COMMIT BLOCKED: tests failed. Fix them, or 'git commit --no-verify' only if you truly mean to."
+  exit 1
+fi
