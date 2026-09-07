@@ -223,8 +223,15 @@ def main():
         rows = []
         for addr, v in agg.items():
             meta = a2s.get(addr, {})
-            ods = organic_score(v["payers"], v["repeat"], v["top1"], v["hhi"],
-                                v["settlements"])
+            # Paid-demand metrics require PAID demand (D3): eleven address-days
+            # of zero-dollar transfers once earned demand scores of 40-60. No
+            # dollars, no demand shape; the row stays (it is real chain
+            # activity) but carries no score or label.
+            if (v.get("usdc") or 0) > 0:
+                ods = organic_score(v["payers"], v["repeat"], v["top1"], v["hhi"],
+                                    v["settlements"])
+            else:
+                ods = None
             rows.append({
                 "address": addr,
                 "service": meta.get("service") or addr[:10] + "…",
@@ -251,7 +258,8 @@ def main():
                 "top_payer_share": v["top1"],
                 "top5_payer_share": v["top5"],
                 "payer_hhi": v["hhi"],
-                "demand": demand_label(v["payers"], v["repeat"], v["top1"], v["hhi"]),
+                "demand": (demand_label(v["payers"], v["repeat"], v["top1"], v["hhi"])
+                           if (v.get("usdc") or 0) > 0 else None),
                 # Organic Demand Score: the shape of the demand as one number,
                 # with its components kept so it can always be taken apart.
                 "organic_score": (ods or {}).get("score"),

@@ -359,14 +359,38 @@ def main():
     existing = os.path.join(HIST, f"settlements_{stamp}.json")
     if os.path.exists(existing):
         try:
-            prior_hours = json.load(open(existing)).get("hours", 0)
+            _prior = json.load(open(existing))
         except Exception:
-            prior_hours = 0
+            _prior = {}
+        prior_hours = _prior.get("hours", 0)
         if prior_hours > args.hours and not args.force:
             raise SystemExit(
                 f"refusing to overwrite: {os.path.basename(existing)} already covers "
                 f"{prior_hours}h and this run is only {args.hours}h. "
                 f"A short test sweep must not replace a full day. Use --force to override.")
+        # Protect a good snapshot (D1): a same-window rerun that lost ranges must
+        # never replace a cleaner one. Failed ranges are the HIGH-VOLUME ranges
+        # (volume is what makes a getLogs response too large), so on 8/21 a 4%
+        # query-failure rate cost HALF the transaction count; comparing failure
+        # counts alone is a badly biased proxy, so the settlement count is
+        # compared too.
+        _pm = _prior.get("meta") or {}
+        _prior_fq = _pm.get("failed_queries", 0) or 0
+        _prior_n = sum(int(v.get("settlements") or 0)
+                       for v in (_prior.get("by_address") or {}).values())
+        _new_n = sum(int(v.get("settlements") or 0) for v in per_addr.values())
+        if prior_hours == args.hours and not args.force:
+            if _prior_fq == 0 and _fq > 0:
+                raise SystemExit(
+                    f"refusing to overwrite a CLEAN day with a partial one: "
+                    f"{os.path.basename(existing)} swept with 0 failed queries, this run "
+                    f"failed {_fq}. Keep the clean snapshot; --force to override.")
+            if _new_n < _prior_n * 0.9:
+                raise SystemExit(
+                    f"refusing to overwrite: the existing day holds {_prior_n:,} settlements "
+                    f"and this run found only {_new_n:,} ({_new_n * 100 // max(_prior_n, 1)}%). "
+                    f"A smaller same-window result is a lossier sweep, not new truth. "
+                    f"--force to override.")
     json.dump({"date": stamp, "generated": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
                "hours": args.hours, "meta": meta, "by_address": per_addr},
               open(os.path.join(HIST, f"settlements_{stamp}.json"), "w"), indent=1)

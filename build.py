@@ -1081,8 +1081,16 @@ def _organic_view(w):
     # concentration. A flag on the shape of the demand, not a verdict, but as a
     # share of the money it is the headline this page exists to state. See
     # _fails_organic: outflow/payout is deliberately not part of it.
-    total = w.get("total_usdc") or sum((r.get("usdc") or 0) for r in rows) or 1.0
-    wash_usdc = sum((r.get("usdc") or 0) for r in rows if _fails_organic(r))
+    # D4: the organic test is MEASURED ON BASE (concentration and repeat are
+    # not swept on Solana), so the wash share is computed on Base-measured
+    # dollars only. Applying a Base-only judgment to a seller's combined
+    # cross-chain total once swept $2,925.64 of unmeasured Solana inflow into
+    # the wash number.
+    def _base_usd(r):
+        b = r.get("base_usdc")
+        return b if b is not None else (r.get("usdc") or 0)
+    total = sum(_base_usd(r) for r in rows) or 1.0
+    wash_usdc = sum(_base_usd(r) for r in rows if _fails_organic(r))
     wash_pct = 100 * wash_usdc / total
 
     trs = []
@@ -1146,7 +1154,7 @@ if LB:
         'raw settled USDC. One wallet paying itself a thousand times outranks a thousand real buyers. '
         'This page ranks the same services by <b>Organic Demand Score</b> instead, the shape of the money '
         'rather than its size, and puts the money rank next to it so the reshuffle is visible.</p>'
-        f'<p class="hero-stat"><b>{_wash_pct:.0f}%</b> of the last 7 days of reported x402 volume '
+        f'<p class="hero-stat"><b>{_wash_pct:.0f}%</b> of the last 7 days of Base-measured x402 volume '
         f'(${_wash_usdc:,.0f} of ${_ototal:,.0f}) comes from services that score below 40 on organic '
         f'demand, or where a single wallet supplied 90% or more of the dollars.</p>'
         + (f'<div class="callout"><p><b>Biggest by money, thinnest by demand</b></p><ul class="tight">{_infl_html}</ul></div>' if _infl_html else '')
@@ -4325,8 +4333,11 @@ if LB:
         vrank = {id(r): i + 1 for i, r in enumerate(by_vol)}
         scored = sorted((r for r in rows if r.get("organic_score") is not None),
                         key=lambda r: (-(r["organic_score"]), -(r.get("usdc") or 0)))
-        total = w.get("total_usdc") or sum((r.get("usdc") or 0) for r in rows) or 1.0
-        wash = sum((r.get("usdc") or 0) for r in rows if _fails_organic(r))
+        def _base_usd(r):
+            b = r.get("base_usdc")
+            return b if b is not None else (r.get("usdc") or 0)
+        total = sum(_base_usd(r) for r in rows) or 1.0
+        wash = sum(_base_usd(r) for r in rows if _fails_organic(r))
         out = []
         for i, r in enumerate(scored, 1):
             mr = vrank[id(r)]
@@ -4343,6 +4354,7 @@ if LB:
                 "inflated": (i - mr) >= 5,
             })
         return {"wash_share_pct": round(wash / total * 100, 1),
+                "wash_scope": "base-measured dollars only; Solana inflow is excluded because concentration is not swept there",
                 "wash_usdc": round(wash, 2), "total_usdc": round(total, 2),
                 "ranking": out}
     json.dump({
