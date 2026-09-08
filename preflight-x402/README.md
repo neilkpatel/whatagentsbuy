@@ -96,9 +96,32 @@ v.payment_history;              // { times_paid, span_days, delivered, accurate,
 - **Block on RED only, by default.** A red light fires only from hard evidence
   (payTo mismatch, phantom paywall, a reverified severe underdeliver). HOLD warns;
   you decide. Change with `block` / `warn` options.
+- **A wiring mistake is loud; an outage is quiet.** These are different failures and
+  get opposite treatment. If preflight is unreachable, you get `UNRATED` and your
+  payment proceeds. If you hand it something that is *not a payment target* (an
+  object, an event name, an empty string) it throws `PreflightInputError`
+  immediately, because silently accepting it would leave you believing a guard was
+  running when nothing was checked. Real traffic on 2026-09-05 did exactly this: 79
+  calls whose target was `"[object Object]"` or a Node event name, all answered
+  `UNRATED`, all unguarded, with nothing to notice.
 - **The always-rule overrides everything.** Whatever the verdict says, read the
   `payTo` and amount out of the **live 402** and sign against those, never a listing
   (including this one).
+
+### Wiring it correctly
+
+`preflightFetch` wraps **a fetch function** and returns a fetch-shaped function. It is
+not an event handler and not a middleware factory.
+
+```js
+// right: wrap the fetch, call the wrapper like fetch
+const f = preflightFetch(fetch);                       // or your paying fetch
+await f("https://seller.example/api");                 // string | URL | Request
+
+// wrong: passing a non-target — throws PreflightInputError with the fix in the message
+await f({ method: "POST" });                           // -> "expected a URL string..."
+emitter.on("data", f);                                 // -> "\"data\" looks like an event name"
+```
 
 ## Options
 
