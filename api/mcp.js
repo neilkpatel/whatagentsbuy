@@ -580,6 +580,27 @@ export async function runTool(name, args, fetchJson = siteJson) {
     const ALWAYS =
       "Whatever this says, read the payTo and the amount out of the live 402 on every call and sign against " +
       "those, never a listing.";
+    // A target that cannot be a host is a CALLER WIRING BUG, and answering it
+    // with a plain UNRATED hides that: on 2026-09-05 an integration sent 79
+    // calls for "[object Object]" and Node event names ("data", "ready",
+    // "connect"), got UNRATED for every one, and kept paying with no guard
+    // running. Older clients still do this, so the server names it. The
+    // response SHAPE is unchanged (still a verdict object, still fail-open) —
+    // it just tells the truth about why there is no verdict.
+    const looksLikeHost = host === "localhost" || host.endsWith(".localhost") || host.includes(".");
+    if (!looksLikeHost) {
+      return {
+        host, light: "gray", verdict: "UNRATED", input_error: true,
+        gate: `"${host}" is not a hostname, so nothing was checked and this is NOT a clearance. ` +
+          "Pass the seller URL you are about to pay, e.g. https://seller.example/api. " +
+          "If you are using preflight-x402, wrap the fetch function itself " +
+          "(preflightFetch(fetch)) and call the wrapper the way you call fetch; " +
+          "passing an object or an event name produces exactly this.",
+        reasons: [{ level: "yellow", text: "The target could not be read as a host. Your client is " +
+          "likely passing something other than the seller URL." }],
+        always: ALWAYS, as_of: pf.generated,
+      };
+    }
     const detail = a.detail ? await paymentSafetyDetail(host, fetchJson) : undefined;
     if (!v) {
       return {

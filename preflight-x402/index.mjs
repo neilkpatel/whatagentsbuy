@@ -43,18 +43,86 @@ export class PreflightAbort extends Error {
 }
 
 /**
+ * Thrown when the caller hands preflight something that is not a payment target.
+ * This is a WIRING mistake in your code, surfaced immediately and loudly, and it
+ * is deliberately NOT the same as a preflight outage: an outage fails open (your
+ * payments proceed), but silently accepting a non-URL would leave you believing
+ * a guard was running when it was not.
+ */
+export class PreflightInputError extends TypeError {
+  constructor(msg, received) {
+    super(msg);
+    this.name = "PreflightInputError";
+    this.received = received;
+  }
+}
+
+// Event names seen in the wild when a caller wires this into an emitter instead
+// of a fetch. Real hosts always contain a dot, so these are unambiguous.
+const EVENTISH = new Set(["data", "end", "error", "close", "connect", "ready", "init",
+  "message", "open", "request", "response", "finish", "drain", "abort", "test"]);
+
+/**
+ * Pull the payment target out of whatever the caller passed, accepting exactly
+ * the shapes the fetch API itself accepts (string | URL | Request), and reject
+ * anything that cannot be a seller. Returns a trimmed URL/host string.
+ */
+export function targetUrl(input) {
+  let raw = null;
+  if (typeof input === "string") raw = input;
+  else if (input && typeof input.href === "string") raw = input.href;   // URL
+  else if (input && typeof input.url === "string") raw = input.url;     // Request
+  const shown = typeof input === "string" ? input : Object.prototype.toString.call(input);
+
+  if (raw === null) {
+    throw new PreflightInputError(
+      `preflight: expected a URL string, a URL, or a Request, but received ${shown}. ` +
+      "If you are wrapping a fetch, pass the function itself: " +
+      "preflightFetch(fetch) — then call the wrapper the way you call fetch(url).",
+      input);
+  }
+  const s = String(raw).trim();
+  if (!s) {
+    throw new PreflightInputError("preflight: received an empty URL.", input);
+  }
+  let host;
+  try {
+    host = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : "https://" + s).hostname.toLowerCase();
+  } catch {
+    throw new PreflightInputError(
+      `preflight: ${JSON.stringify(s.slice(0, 80))} is not a URL or hostname.`, input);
+  }
+  const ok = host === "localhost" || host.endsWith(".localhost") || host.includes(".");
+  if (!ok) {
+    const hint = EVENTISH.has(host)
+      ? ` "${host}" looks like an event name. preflightFetch wraps a FETCH function, not an ` +
+        "event handler: const f = preflightFetch(fetch); await f('https://seller.example/api')."
+      : " A seller host contains a dot, e.g. seller.example or https://seller.example/api.";
+    throw new PreflightInputError(
+      `preflight: ${JSON.stringify(s.slice(0, 80))} is not a payment target.${hint}`, input);
+  }
+  return s;
+}
+
+/**
  * Fetch the pre-payment verdict for a URL or bare host.
  * Returns the verdict object: { host, verdict, light, gate, reasons, evidence, ... }.
  * Never throws on a network problem — returns an UNRATED verdict so a preflight
- * outage cannot block payments.
+ * outage cannot block payments. It DOES throw PreflightInputError when the target
+ * itself is not a URL or host, because that is your bug, not our downtime, and
+ * failing open on it would hand you an unguarded payment path with no signal.
  */
 export async function preflight(url, {
   endpoint = DEFAULT_ENDPOINT, detail = false, timeoutMs = 4000,
   client = DEFAULT_UA, fetchImpl = fetch,
 } = {}) {
-  // Normalize at the boundary: a whitespace-padded URL once reached the server
-  // raw, parsed to host "https:", and downgraded a known ABORT to UNRATED.
-  url = String(url ?? "").trim();
+  // Validate and normalize at the boundary. Two real failures drove this: a
+  // whitespace-padded URL once parsed to host "https:" and downgraded a known
+  // ABORT to UNRATED, and on 2026-09-05 an integration sent 79 calls whose
+  // targets were "[object Object]" and Node event names ("data", "ready",
+  // "connect"), every one answered UNRATED — a guard that was doing nothing
+  // while looking like it worked.
+  url = targetUrl(url);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -144,10 +212,19 @@ export async function guardedPay(url, pay, opts = {}) {
  * sellers a real wallet has already tested.
  */
 export function preflightFetch(innerFetch, opts = {}) {
-  if (typeof innerFetch !== "function") throw new TypeError("preflightFetch(innerFetch): innerFetch must be a function");
+  if (typeof innerFetch !== "function") {
+    throw new PreflightInputError(
+      "preflightFetch(innerFetch): innerFetch must be the fetch function you want guarded, " +
+      "e.g. preflightFetch(fetch) or preflightFetch(wrapFetchWithPayment(fetch, wallet)). " +
+      `Received ${Object.prototype.toString.call(innerFetch)}.`, innerFetch);
+  }
   return async function preflightedFetch(input, init) {
-    const url = typeof input === "string" ? input
-      : (input && (input.url || input.href)) || String(input);
+    // targetUrl accepts exactly what fetch accepts (string | URL | Request) and
+    // throws PreflightInputError on anything else. The old form fell back to
+    // String(input), which turned an object into the literal "[object Object]",
+    // sent that as the seller, got UNRATED back, and passed the payment
+    // through unguarded — a broken integration with no error to notice.
+    const url = targetUrl(input);
     await assertPayable(url, opts);   // throws PreflightAbort on ABORT, warns on HOLD
     return innerFetch(input, init);
   };

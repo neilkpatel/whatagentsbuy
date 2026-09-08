@@ -333,3 +333,25 @@ test("handler: a valid single ping over the stream works", async () => {
   assert.equal(res.statusCode, 200);
   assert.deepEqual(res.body, { jsonrpc: "2.0", id: 1, result: {} });
 });
+
+test("preflight names a non-host target instead of shrugging UNRATED", async () => {
+  // 2026-09-05: 79 real calls for "[object Object]" and event names each came
+  // back a bare UNRATED, so a broken integration kept paying unguarded with no
+  // signal. Older clients still send these; the server must diagnose them.
+  const fx = { "/api/preflight.json": { generated: "2026-09-07", sellers: {} } };
+  for (const bad of ["[object Object]", "data", "ready", "connect"]) {
+    const r = await runTool("preflight", { url: bad }, mockFetch(fx));
+    assert.equal(r.verdict, "UNRATED");
+    assert.equal(r.input_error, true, `${bad} should be flagged as an input error`);
+    assert.match(r.gate, /is not a hostname/);
+    assert.match(r.gate, /NOT a clearance/);
+  }
+  // a real host with no data still gets the ordinary "no data" answer
+  const ok = await runTool("preflight", { url: "unknown-seller.example" }, mockFetch(fx));
+  assert.equal(ok.verdict, "UNRATED");
+  assert.equal(ok.input_error, undefined);
+  assert.match(ok.gate, /No data on this host yet/);
+  // localhost stays usable for local development
+  const local = await runTool("preflight", { url: "http://localhost:8080/x" }, mockFetch(fx));
+  assert.equal(local.input_error, undefined);
+});
