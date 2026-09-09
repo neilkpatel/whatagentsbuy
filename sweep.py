@@ -24,6 +24,8 @@ Usage:
 import argparse, json, os, time, urllib.error, urllib.request
 from collections import defaultdict
 
+import buyers
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 HIST = os.path.join(DATA, "history")
@@ -63,15 +65,41 @@ def jrpc(url, method, params, timeout=45):
     return d["result"]
 
 
-def pick_rpc():
-    """Return the first endpoint that actually SERVES real log queries.
+# QUOTA_MARKERS is checked against the lowercased error text. A quota or auth
+# refusal is a property of the ENDPOINT, not of the range, so retrying the same
+# endpoint cannot succeed and every retry is pure latency. 2026-09-09: three of
+# four public endpoints failed this way at once (drpc "-32001 usage limit",
+# publicnode HTTP 403, llamarpc HTTP 525) and the sweep spent 3h42m grinding
+# 3 doomed retries plus backoff over ~400 ranges before failing over.
+QUOTA_MARKERS = ("usage limit", "rate limit", "too many requests", "429",
+                 "403", "forbidden", "-32001", "quota", "exceeded", "525",
+                 "unauthorized", "payment required")
+
+
+def is_endpoint_refusal(err):
+    """True if this error means the ENDPOINT is refusing us, not that the range
+    is bad. Those must fail over immediately instead of burning MAX_RETRIES."""
+    return any(m in str(err).lower() for m in QUOTA_MARKERS)
+
+
+def pick_rpc(sample_topics=None):
+    """Return the first endpoint that actually SERVES the query this sweep makes.
 
     publicnode and mainnet.base.org answer eth_blockNumber and a tiny 2-block
     getLogs but return empty (or reject) on realistic ranges. The old test used a
     2-block window, so those endpoints passed and the full sweep then came back
     empty, silently recording $0 days (8/15 and 8/17 were lost this way). USDC
     transfers on Base happen many times per block, so a ~50-block window must come
-    back non-empty; if it does not, the endpoint cannot serve this query."""
+    back non-empty; if it does not, the endpoint cannot serve this query.
+
+    A 50-block probe is still not the workload. A rate-limited endpoint answers
+    small queries and refuses the 2000-block, 150-address ones this sweep is made
+    of, so it PASSED the old check and was then chosen as primary. On 2026-09-09
+    base.drpc.org did exactly that: fine on the probe, "-32001 usage limit" on
+    every real range. When `sample_topics` is given, the check now runs one
+    genuinely representative query, so the endpoint is tested on what it will be
+    asked to do.
+    """
     for url in RPCS:
         try:
             tip = int(jrpc(url, "eth_blockNumber", [], timeout=20), 16)
@@ -80,9 +108,15 @@ def pick_rpc():
             if not logs:
                 print(f"  rpc returns empty on a real range, skipping: {url}")
                 continue
+            if sample_topics:
+                # the real thing: full window, full address batch
+                jrpc(url, "eth_getLogs", [{
+                    "address": USDC_BASE, "topics": [TRANSFER, None, sample_topics],
+                    "fromBlock": hex(tip - WINDOW_BLOCKS), "toBlock": hex(tip - 1)}], timeout=60)
             return url, tip
         except Exception as e:
-            print(f"  rpc unusable: {url} ({type(e).__name__})")
+            note = " (endpoint refusing us, not a bad range)" if is_endpoint_refusal(e) else ""
+            print(f"  rpc unusable: {url} ({type(e).__name__}: {str(e)[:70]}){note}")
     raise SystemExit("no usable public Base RPC for eth_getLogs")
 
 
@@ -91,13 +125,16 @@ def topic_for(addr):
 
 
 def sweep_rpc(addresses, hours):
-    url, tip = pick_rpc()
+    topics = [topic_for(a) for a in addresses]
+    batches = [topics[i:i + ADDR_BATCH] for i in range(0, len(topics), ADDR_BATCH)]
+    # Test each candidate on the query this sweep is actually made of, not on a
+    # toy range. A quota-limited endpoint passes a 50-block probe and refuses
+    # every real one, which is how a doomed endpoint got chosen as primary.
+    url, tip = pick_rpc(sample_topics=batches[0] if batches else None)
     span = int(hours * 3600 / BLOCK_SECONDS)
     start = tip - span
     print(f"  provider rpc={url} tip={tip:,} scanning {span:,} blocks (~{hours}h)")
 
-    topics = [topic_for(a) for a in addresses]
-    batches = [topics[i:i + ADDR_BATCH] for i in range(0, len(topics), ADDR_BATCH)]
     logs, out_logs = [], []
     windows = list(range(start, tip, WINDOW_BLOCKS))
     # two passes: money in (topic 2 = recipient) and money out (topic 1 = sender).
@@ -112,7 +149,14 @@ def sweep_rpc(addresses, hours):
                 return jrpc(ep, "eth_getLogs", [{
                     "address": USDC_BASE, "topics": topics,
                     "fromBlock": hex(lo), "toBlock": hex(hi)}]), True
-            except Exception:
+            except Exception as e:
+                # A quota/auth refusal is about the ENDPOINT, not this range, so
+                # retrying the same endpoint is guaranteed to fail and only buys
+                # latency. Give up on it immediately and let the caller fail over.
+                # On 2026-09-09 three endpoints refused at once and the sweep
+                # spent 3h42m paying 3 doomed attempts plus backoff per range.
+                if is_endpoint_refusal(e):
+                    return None, False
                 if attempt < (retries or MAX_RETRIES) - 1:
                     time.sleep(1.2 * (attempt + 1))
         return None, False
@@ -273,6 +317,43 @@ def decode(logs):
     return out
 
 
+def overwrite_refusal(prior, new_per_addr, hours, new_failed, rows_key="by_address"):
+    """Should this run refuse to overwrite an existing day file? Pure, so the
+    guard on the ONE unrecoverable pipeline is testable: a missed or corrupted
+    settlement day cannot be re-swept later (the window is rolling), and this
+    function is the last thing standing between a lossy re-run and the tape.
+
+    Returns a refusal reason, or None to allow the write. `force` is handled by
+    the caller. Three refusals:
+      1. a SHORTER window must never replace a longer one (a test sweep vs a day)
+      2. a run with failed ranges must never replace a CLEAN same-window snapshot
+      3. a same-window run holding <90% of the prior settlements is a lossier
+         sweep, not new truth. Failure COUNT alone is a badly biased proxy: on
+         2026-08-21 a 4% query-failure rate cost half the transaction count,
+         because the ranges that fail are precisely the high-volume ones.
+    Everything is defensive about shape: a malformed prior file must never crash
+    the sweep, it should simply not block the write.
+    """
+    prior_hours = prior.get("hours", 0) or 0
+    if prior_hours > hours:
+        return (f"refusing to overwrite: that day already covers {prior_hours}h and this "
+                f"run is only {hours}h; a short test sweep must not replace a full day.")
+    if prior_hours != hours:
+        return None
+    prior_failed = (prior.get("meta") or {}).get("failed_queries", 0) or 0
+    if prior_failed == 0 and (new_failed or 0) > 0:
+        return (f"refusing to overwrite a CLEAN day with a partial one: the saved sweep had 0 "
+                f"failed queries and this run failed {new_failed}; keep the clean snapshot.")
+    def _n(rows):
+        return sum(int((v or {}).get("settlements") or 0) for v in (rows or {}).values())
+    prior_n, new_n = _n(prior.get(rows_key)), _n(new_per_addr)
+    if prior_n and new_n < prior_n * 0.9:
+        return (f"refusing to overwrite: the existing day holds {prior_n:,} settlements and this "
+                f"run found only {new_n:,} ({new_n * 100 // max(prior_n, 1)}%); a smaller "
+                f"same-window result is a lossier sweep, not new truth.")
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=float, default=24)
@@ -301,6 +382,7 @@ def main():
     if not addresses:
         raise SystemExit("no seller addresses; run probe.py first")
 
+    per_buyer = None
     if args.provider == "rpc":
         logs, out_logs, meta = sweep_rpc(addresses, args.hours)
         per_addr = decode(logs)
@@ -314,6 +396,11 @@ def main():
             rec.setdefault("usdc_out", 0.0)
             rec.setdefault("transfers_out", 0)
             rec["usdc_net"] = round(rec["usdc"] - rec["usdc_out"], 6)
+        # The buyer side, off the SAME logs: no extra RPC, no extra money. The
+        # seller rollup above keeps only the shape of who paid, so without this
+        # the payer addresses are discarded and that day is unrecoverable (the
+        # window is rolling). See buyers.py for why log.from is the real buyer.
+        per_buyer = buyers.decode_buyers(logs, seller_addrs=set(addresses))
     else:
         raise SystemExit("blockscout sweep lives in onchain.py; use --provider rpc here")
 
@@ -362,40 +449,42 @@ def main():
             _prior = json.load(open(existing))
         except Exception:
             _prior = {}
-        prior_hours = _prior.get("hours", 0)
-        if prior_hours > args.hours and not args.force:
-            raise SystemExit(
-                f"refusing to overwrite: {os.path.basename(existing)} already covers "
-                f"{prior_hours}h and this run is only {args.hours}h. "
-                f"A short test sweep must not replace a full day. Use --force to override.")
-        # Protect a good snapshot (D1): a same-window rerun that lost ranges must
-        # never replace a cleaner one. Failed ranges are the HIGH-VOLUME ranges
-        # (volume is what makes a getLogs response too large), so on 8/21 a 4%
-        # query-failure rate cost HALF the transaction count; comparing failure
-        # counts alone is a badly biased proxy, so the settlement count is
-        # compared too.
-        _pm = _prior.get("meta") or {}
-        _prior_fq = _pm.get("failed_queries", 0) or 0
-        _prior_n = sum(int(v.get("settlements") or 0)
-                       for v in (_prior.get("by_address") or {}).values())
-        _new_n = sum(int(v.get("settlements") or 0) for v in per_addr.values())
-        if prior_hours == args.hours and not args.force:
-            if _prior_fq == 0 and _fq > 0:
-                raise SystemExit(
-                    f"refusing to overwrite a CLEAN day with a partial one: "
-                    f"{os.path.basename(existing)} swept with 0 failed queries, this run "
-                    f"failed {_fq}. Keep the clean snapshot; --force to override.")
-            if _new_n < _prior_n * 0.9:
-                raise SystemExit(
-                    f"refusing to overwrite: the existing day holds {_prior_n:,} settlements "
-                    f"and this run found only {_new_n:,} ({_new_n * 100 // max(_prior_n, 1)}%). "
-                    f"A smaller same-window result is a lossier sweep, not new truth. "
-                    f"--force to override.")
+        _refuse = overwrite_refusal(_prior, per_addr, args.hours, _fq)
+        if _refuse and not args.force:
+            raise SystemExit(f"{_refuse} ({os.path.basename(existing)}) Use --force to override.")
     json.dump({"date": stamp, "generated": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
                "hours": args.hours, "meta": meta, "by_address": per_addr},
               open(os.path.join(HIST, f"settlements_{stamp}.json"), "w"), indent=1)
 
-    latest["settlement_source"] = f"Base {meta['provider']} ({meta['endpoint']}), USDC transfers to seller addresses"
+    # Buyer tape, written beside the seller tape as its own file so the existing
+    # format is untouched and nothing downstream can break. Every reader of
+    # data/history/ filters on the "settlements_" prefix, so this file cannot
+    # reach public/ without a deliberate change: buyer addresses stay internal
+    # until there is a decision to publish them.
+    if per_buyer is not None:
+        _bpath = os.path.join(HIST, f"buyers_{stamp}.json")
+        _brefuse = None
+        if os.path.exists(_bpath):
+            try:
+                _bprior = json.load(open(_bpath))
+            except Exception:
+                _bprior = {}
+            _brefuse = overwrite_refusal(_bprior, per_buyer, args.hours, _fq, rows_key="by_buyer")
+        if _brefuse and not args.force:
+            # The seller day is already saved; refuse only this file rather than
+            # killing a run that has otherwise succeeded.
+            print(f"  buyer tape NOT written: {_brefuse}")
+        else:
+            json.dump({"date": stamp, "generated": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                       "hours": args.hours, "meta": meta, "method": buyers.METHOD,
+                       "summary": buyers.summarize(per_buyer), "by_buyer": per_buyer},
+                      open(_bpath, "w"), indent=1)
+            _bs = buyers.summarize(per_buyer)
+            print(f"  buyer tape: {_bs['buyers']:,} distinct buyers, "
+                  f"{_bs['resellers']:,} of them listed sellers, "
+                  f"top buyer {_bs['top_buyer_share']:.1%} of dollars")
+
+    latest["settlement_source"] =f"Base {meta['provider']} ({meta['endpoint']}), USDC transfers to seller addresses"
     latest["settlement_window_hours"] = args.hours
     latest["settlement_generated"] = time.strftime("%Y-%m-%d %H:%M:%S %Z")
     json.dump(latest, open(os.path.join(DATA, "latest.json"), "w"), indent=1)

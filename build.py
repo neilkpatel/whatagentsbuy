@@ -132,6 +132,12 @@ AGENT_WEEK_HITS = len(_agent_week)
 AGENT_WEEK_CLIENTS = len({h.get("client") for h in _agent_week})
 
 SITE = "https://whatagentsbuy.com"
+# The advertised MCP tool set. Every "N tools" on the site derives from this so a
+# page cannot say five while tools/list says seven (2026-09-09 evaluation, W3).
+# tests.py checks it against the TOOLS array in api/mcp.js.
+MCP_TOOLS = ["find_api", "check_before_paying", "look_up_seller", "rank_sellers",
+             "rank_by_accuracy", "market_size", "known_payment_traps"]
+MCP_TOOL_COUNT = len(MCP_TOOLS)
 # Authored under a real, accountable identity: the E-E-A-T credibility signal
 # Google and the AI crawlers read. Contact is LinkedIn; no email. The @crowdturtle
 # pseudonym is retired from the page now that the site is not anonymous.
@@ -580,7 +586,7 @@ if LB:
         '</div>'
         '</div>'
         f'<div class="heroline"><p>{_heroline} '
-        '<a class="heromcp" href="#mcp">Free MCP server for your agent &rarr;</a></p></div>'
+        '<a class="heromcp" href="/api#mcp">Free MCP server for your agent &rarr;</a></p></div>'
         '</div>')
 
     # The homepage's big front door to the live x402 dashboard. /x402 is one of the
@@ -746,7 +752,7 @@ _mcpbar = (
     'demand score as <b>MCP tools</b>, so it can check a service before it pays. '
     'Free, no key, nothing to install.</div>'
     '<code class="mcpcmd">claude mcp add --transport http whatagentsbuy https://whatagentsbuy.com/mcp</code>'
-    '<a class="mcplink" href="/api">The five tools, and the raw JSON</a>'
+    f'<a class="mcplink" href="/api#mcp">The {MCP_TOOL_COUNT} tools, and the raw JSON</a>'
     '</div>')
 
 compact_rows = []
@@ -1093,6 +1099,7 @@ def _organic_view(w):
     wash_usdc = sum(_base_usd(r) for r in rows if _fails_organic(r))
     wash_pct = 100 * wash_usdc / total
 
+    _hc = collections.Counter(x.get("host") for x in by_org)
     trs = []
     for i, r in enumerate(by_org, 1):
         _os = r["organic_score"]
@@ -1109,6 +1116,8 @@ def _organic_view(w):
         else:
             verdict = '<span class="dim">&mdash;</span>'
         _label = r.get("host") or r["service"]
+        if _hc[r.get("host")] > 1 and r.get("address"):
+            _label += f' &middot; wallet {r["address"][:8]}&hellip; (scored per wallet)'
         trs.append(
             '<tr>'
             f'<td class="lbrank">{i}</td>'
@@ -1167,7 +1176,10 @@ if LB:
           'identical to a wallet paying itself, and nothing on chain separates them. Read it beside the '
           '<b>Buyers</b> and <b>Repeat</b> counts, never alone. Same score, same tape as the '
           '<a href="/leaderboard">money leaderboard</a>, only re-sorted. '
-          f'7-day window, {LB["first_day"]} to {LB["last_day"]}, swept daily from Base and Solana. '
+          f'Scores use the last {len(_ow.get("dates") or [])} swept days, '
+          f'{(_ow.get("dates") or [LB["first_day"]])[0]} to {LB["last_day"]}; the full tape runs '
+          f'{LB["first_day"]} to {LB["last_day"]}. Revenue folds in Solana; every demand-shape figure '
+          f'(buyers, repeat, concentration, the score) is measured on Base only. '
           'The wash-adjusted ranking is also an <a href="/api/organic.json">MCP tool and JSON feed</a>.</p>')
 else:
     organic_html = '<p class="note">No leaderboard data yet. Run leaderboard.py.</p>'
@@ -1926,7 +1938,8 @@ SEARCH_JS = r"""<script>
       var bits=[];
       if(it.price!=null) bits.push('from $'+it.price);
       if(it.rel!=null) bits.push('rel '+it.rel);
-      if(it.status==='listed') bits.push('not yet tested');
+      if(it.status==='listed') bits.push(it.external?'not yet tested · opens the seller\'s site':'not yet tested');
+      else if(it.external) bits.push('opens the seller\'s site');
       else if(it.delivered===true) bits.push('delivers');
       else if(it.delivered===false) bits.push('fell short');
       return bits.join(' · ');
@@ -1940,13 +1953,14 @@ SEARCH_JS = r"""<script>
     if(!list.length){ box.innerHTML='<div class="qempty">Nothing measured for that yet.</div>'; box.hidden=false; return; }
     var more = total>list.length ? '<div class="qmore">+'+(total-list.length)+' more · keep typing to narrow</div>' : '';
     box.innerHTML=list.map(function(it,i){
-      var tag=it.url?'a':'div', href=it.url?(' href="'+it.url+'"'):'';
+      var ext=!!it.external;
+      var tag=it.url?'a':'div', href=it.url?(' href="'+it.url+'"'+(ext?' target="_blank" rel="noopener"':'')):'';
       var right = it.t==='host' ? '<span class="qmeta">'+esc(meta(it))+'</span>' : '';
       return '<'+tag+' class="qrow" role="option"'+href+' data-i="'+i+'">'
         +'<span class="qbadge '+bcls(it)+'">'+badge(it)+'</span>'
         +'<span class="qmain"><span class="qname">'+esc(it.label)+'</span>'
         +'<span class="qsub">'+esc(sub(it))+'</span></span>'+right+'</'+tag+'>';
-    }).join('')+more+'<div class="qhint">graded = we paid and graded it · measured = we swept it · listed = in the registry, untested by us</div>';
+    }).join('')+more+'<div class="qhint">graded = we paid and graded it · measured = we swept it · listed = in the registry, untested by us (opens the seller\'s own site)</div>';
     box.hidden=false; sel=-1;
   }
   var bar=q.closest('.searchbar');
@@ -1987,7 +2001,7 @@ SEARCH_JS = r"""<script>
     var opts=box.querySelectorAll('.qrow');
     if(e.key==='ArrowDown'){ e.preventDefault(); sel=Math.min(sel+1,opts.length-1); }
     else if(e.key==='ArrowUp'){ e.preventDefault(); sel=Math.max(sel-1,0); }
-    else if(e.key==='Enter'){ if(opts[sel]&&opts[sel].tagName==='A'){ location.href=opts[sel].getAttribute('href'); } return; }
+    else if(e.key==='Enter'){ if(opts[sel]&&opts[sel].tagName==='A'){ var h=opts[sel].getAttribute('href'); if(opts[sel].getAttribute('target')==='_blank'){ window.open(h,'_blank','noopener'); } else { location.href=h; } } return; }
     else if(e.key==='Escape'){ box.hidden=true; q.blur(); return; }
     else return;
     opts.forEach(function(o){o.classList.remove('sel');});
@@ -2711,11 +2725,11 @@ verdict per seller, the check an agent runs before the x402 402. Each host carri
 Or call the <code>preflight</code> MCP tool with a URL. See <a href="/preflight">/preflight</a>.</li>
 </ol>
 
-<h3>MCP server</h3>
+<h3 id="mcp">MCP server</h3>
 <p class="glede">If your agent speaks MCP, it can query all of this as tools instead of fetching and
 joining files. Remote server, nothing to install, no key and no payment:</p>
 <pre class="cmd"><code>claude mcp add --transport http whatagentsbuy https://whatagentsbuy.com/mcp</code></pre>
-<p class="glede"><b>Seven tools. Which one for which job:</b></p>
+<p class="glede"><b>{MCP_TOOL_COUNT} tools. Which one for which job:</b></p>
 <ul class="toolguide">
 <li>Need an API that does something &rarr; <code>find_api(task)</code> &mdash; a ranked, payable shortlist</li>
 <li>About to pay one &rarr; <code>check_before_paying(url)</code> &mdash; one CLEAR / HOLD / ABORT verdict to gate on (<code>detail:true</code> for the full read). <b>The one you call before every payment.</b></li>
@@ -2728,8 +2742,30 @@ joining files. Remote server, nothing to install, no key and no payment:</p>
 <p class="note dim">Renamed for clarity in Aug 2026; the old names (<code>preflight</code>, <code>get_service</code>,
 <code>top_services</code>, <code>most_accurate</code>, <code>is_organic</code>, <code>list_traps</code>,
 <code>market_summary</code>, <code>market_pulse</code>, <code>search_services</code>) still work. Every term is defined in the <a href="/glossary">glossary</a>.</p>
+<h4 id="decision">The decision contract</h4>
+<p class="note dim"><b><code>verdict</code> is the machine field.</b> It is one of <code>CLEAR</code>,
+<code>HOLD</code>, <code>ABORT</code>, <code>UNRATED</code>. <code>light</code> carries the same decision as a
+colour (<code>green</code> / <code>yellow</code> / <code>red</code> / <code>gray</code>) for display; never compare
+<code>light</code> to <code>ABORT</code>. Until 2026-09-09 the prompt below said "gate on the light", which produced
+guards that could never fire. If you copied it, switch the comparison to <code>verdict</code>. Every response also
+carries <code>confidence</code> and <code>as_of</code>; a complete policy uses all three.</p>
+<div class="scroll"><table class="tbl"><thead><tr><th>verdict</th><th>confidence</th><th>strict policy</th><th>permissive policy (what <code>preflight-x402</code> does by default)</th></tr></thead><tbody>
+<tr><td>CLEAR</td><td>verified</td><td>pay</td><td>pay</td></tr>
+<tr><td>CLEAR</td><td>checked / unproven</td><td>cap the amount, or wait for verified</td><td>pay</td></tr>
+<tr><td>HOLD</td><td>any</td><td>do not pay; surface the reasons</td><td>pay, log the reasons</td></tr>
+<tr><td>ABORT</td><td>any</td><td>do not pay</td><td>do not pay</td></tr>
+<tr><td>UNRATED</td><td>unproven</td><td>cap the amount, or do not pay</td><td>pay (fail-open)</td></tr>
+<tr><td><code>input_error: true</code></td><td>&mdash;</td><td>fix the caller; this is not a clearance</td><td>same</td></tr>
+<tr><td>no response, malformed JSON, timeout, 5xx</td><td>&mdash;</td><td>treat as UNRATED under your policy</td><td>fail-open unless you set a floor</td></tr>
+<tr><td><code>as_of</code> older than your freshness floor</td><td>&mdash;</td><td>treat as UNRATED</td><td>pay, log the age</td></tr>
+</tbody></table></div>
+<p class="note dim">The permissive column is the out-of-the-box behaviour of <code>preflight-x402</code>: it blocks only
+<code>ABORT</code> and fails open on everything else. The strict column is what to configure when the payment matters
+(<code>minConfidence: "verified"</code>, and treat HOLD as a stop). Whichever you pick, read the payTo and amount out
+of the live 402 and sign against those. Invalid arguments (a string where a number belongs, an unknown ranking mode, a
+non-string URL) now return an error instead of a silently unconstrained result.</p>
 <p class="glede"><b>Wire it into your agent in one line.</b> Put this in your system prompt:</p>
-<pre class="cmd"><code>Before paying any x402 / HTTP 402 API, call check_before_paying(url) on the whatagentsbuy MCP and gate on the light (CLEAR / HOLD / ABORT / UNRATED). Always read the payTo and amount out of the live 402 and sign against those, never a listing.</code></pre>
+<pre class="cmd"><code>Before paying any x402 / HTTP 402 API, call check_before_paying(url) on the whatagentsbuy MCP and gate on the verdict field (CLEAR / HOLD / ABORT / UNRATED); light is the same verdict as a colour, for display only. Always read the payTo and amount out of the live 402 and sign against those, never a listing.</code></pre>
 <p class="note dim">Full recipe, including the <code>find_api</code> &rarr; <code>preflight</code> &rarr; pay loop:
 <a href="https://github.com/neilkpatel/whatagentsbuy/blob/main/llms-install.md">llms-install.md</a>.</p>
 <p class="note dim">The agent-facing surface is free on purpose. This site argues that measurements
@@ -3260,6 +3296,55 @@ _GL_HOSTS = (set(_PROBE_BY_HOST) | set(_RECEIPTS_BY_HOST)
              | set(_STUDY_RECEIPTS_BY_HOST) | set(_LB_BY_HOST))
 _GREENLIGHT = {h: _greenlight(h) for h in _GL_HOSTS}
 
+_LAB = {}
+_LAB_ASOF = None
+try:
+    _lab_raw = json.load(open(os.path.join(HERE, "data", "lab.json")))
+    _LAB = _lab_raw.get("categories", {})
+    _LAB_ASOF = (_lab_raw.get("generated") or _lab_raw.get("as_of") or "")[:10] or None
+except Exception:
+    _LAB = {}
+
+_CAT_TITLES = {"crypto-price": "Crypto price (BTC/USD)", "stock-price": "Stock price (AAPL)",
+               "fx-rate": "FX rate (EUR/USD)", "gas-price": "Gas price (Base)",
+               "wallet-balance": "Wallet balance (USDC)", "weather": "Weather (New York)"}
+
+
+# --- which hosts get a page, decided ONCE and early -----------------------------
+# Every surface that links /s/<host> (accuracy, preflight, delivery, receipts,
+# search) reads this set, so a link can only point at a page that gets built.
+# The rule: a host gets a page when we hold PAID evidence on it (a grade, an
+# accuracy result, a delivery check, or a receipt). Hosts we merely swept or
+# listed do not; the seller's own site is the destination for those.
+_svc_posts = {}
+for _p in FEED:
+    _nm = (_p.get("api") or {}).get("name")
+    if is_host(_nm) and _p.get("grade"):
+        _svc_posts.setdefault(_nm, []).append(_p)
+_LAB_BY_HOST = {}
+for _cat, _c in _LAB.items():
+    for _r in _c.get("rows", []):
+        if _r.get("value") is not None and is_host(_r.get("host")):
+            _LAB_BY_HOST.setdefault(_r["host"], []).append(
+                {**_r, "_cat": _cat, "_tol": _c.get("tol", 100), "_unit": _c.get("unit", ""),
+                 "_source": _c.get("source"), "_reference": _c.get("reference")})
+_SVC_PAGE_HOSTS = sorted(set(_svc_posts) | set(_LAB_BY_HOST)
+                         | {h for h in _DELIVERY_BY_HOST if is_host(h)}
+                         | {h for h in _RECEIPTS_BY_HOST if is_host(h)})
+_SVC_PAGE_SET = set(_SVC_PAGE_HOSTS)
+# Only pages with a grade or an accuracy result go in the sitemap. Receipt-only
+# and delivery-only pages are built (so nothing 404s) but not advertised: 700
+# thin URLs on a site Google barely indexes would dilute the pages that matter.
+_SVC_SITEMAP_SET = set(_svc_posts) | set(_LAB_BY_HOST)
+
+
+def _svc_link(host, cls="glhost"):
+    """A link to /s/<host> when that page exists, plain text when it does not."""
+    h = html.escape(host or "")
+    return (f'<a class="{cls}" href="/s/{h}">{h}</a>' if host in _SVC_PAGE_SET
+            else f'<span class="{cls}">{h}</span>')
+
+
 _GL_LABEL = {"green": "CLEAR", "yellow": "HOLD", "red": "ABORT", "gray": "UNRATED"}
 
 
@@ -3292,10 +3377,15 @@ def _gl_card(v):
                   for r in v["reasons"] if r["level"] != "good")
     _sc = f' &middot; score {v["score"]}' if v["score"] is not None else ""
     return (f'<article class="glcard"><div class="glcard-top">{_gl_badge(v["light"])}{_conf_chip(v)}'
-            f'<a class="glhost" href="/s/{html.escape(v["host"])}">{html.escape(v["host"])}</a>'
+            + _svc_link(v["host"]) +
             f'<span class="glmeta">{v["receipts"]} receipt{"s" if v["receipts"] != 1 else ""}{_sc}</span></div>'
             f'<ul class="gllist">{_rz}</ul></article>')
 
+
+# Whether /s/<host> exists, so the MCP's seller_page can never point at a 404
+# (the same class of defect as the four featured links on 2026-09-09).
+for _gh, _gv in _GREENLIGHT.items():
+    _gv["page"] = _gh in _SVC_PAGE_SET
 
 from collections import Counter as _Counter
 _gl_counts = _Counter(v["light"] for v in _GREENLIGHT.values())
@@ -3440,18 +3530,6 @@ urls.append("/preflight/spec")
 # the sellers by how close they came to the primary source, so a buyer sees which
 # API returns the most accurate stock quote / crypto price / weather / fx / gas /
 # balance, and at what cost. This data exists nowhere else.
-_LAB = {}
-_LAB_ASOF = None
-try:
-    _lab_raw = json.load(open(os.path.join(HERE, "data", "lab.json")))
-    _LAB = _lab_raw.get("categories", {})
-    _LAB_ASOF = (_lab_raw.get("generated") or _lab_raw.get("as_of") or "")[:10] or None
-except Exception:
-    _LAB = {}
-
-_CAT_TITLES = {"crypto-price": "Crypto price (BTC/USD)", "stock-price": "Stock price (AAPL)",
-               "fx-rate": "FX rate (EUR/USD)", "gas-price": "Gas price (Base)",
-               "wallet-balance": "Wallet balance (USDC)", "weather": "Weather (New York)"}
 
 if _LAB:
     _cat_html, _api_cats = [], {}
@@ -3512,7 +3590,8 @@ if _LAB:
                            "reference": _c.get("reference"), "unit": _unit, "tolerance": _tol,
                            "sellers": [{"host": r["host"], "value": r.get("value"),
                                         "deviation": r.get("dev"), "price_usdc": r.get("quoted"),
-                                        "verdict": "accurate" if r["_ok"] else "off"} for r in _graded]}
+                                        "verdict": "accurate" if r["_ok"] else "off",
+                                        "measured_at": _LAB_ASOF} for r in _graded]}
     _spread_lede = ""
     if _best_spread:
         _sp, _spname, _splo, _sphi = _best_spread
@@ -3520,14 +3599,16 @@ if _LAB:
             f' The prices are not: for {html.escape(_spname.split(" (")[0].lower())}, sellers that all return '
             f'the <b>same correct value</b> charge from <b>${_splo:g}</b> to <b>${_sphi:g}</b> a call, a '
             f'<b>{_sp:.0f}&times;</b> spread. Paying more buys you nothing here.')
-    _asof_txt = (f' Graded {_LAB_ASOF}.' if _LAB_ASOF else '')
+    _asof_txt = (f' Measured {_LAB_ASOF}: a dated sample, not a live guarantee.' if _LAB_ASOF else '')
+    _n_lab_hosts = len({r["host"] for c in _LAB.values() for r in c.get("rows", []) if r.get("value") is not None})
     _catbody = (
         '<p class="note"><b>Consumer Reports for agent APIs.</b> For data with an objective right answer, we '
         'pay every seller and check what they return against a primary source they cannot resell to us, an '
         'exchange median, a professional stock feed, the ECB, the chain itself, a weather model. Nobody else '
         'grades whether a paid API is <i>correct</i>, because it takes actually paying to find out.'
         + _spread_lede + '</p>'
-        f'<p class="note dim"><b>{_n_graded}</b> sellers graded across <b>{len(_api_cats)}</b> categories.'
+        f'<p class="note dim"><b>{_n_graded}</b> seller-category results across <b>{_n_lab_hosts}</b> distinct '
+        f'sellers and <b>{len(_api_cats)}</b> categories.'
         f'{_asof_txt} Machine-readable at <a href="/api/categories.json">/api/categories.json</a> and via the '
         '<code>most_accurate</code> MCP tool. Every grade is a verifiable <a href="/receipts">receipt</a>. '
         'A low deviation is measured, not asserted; where a seller returned nothing usable it is marked '
@@ -3543,6 +3624,10 @@ if _LAB:
     urls.append("/categories")
     json.dump({"generated": NOW_ISO, "source": SITE, "api_version": 1,
                "license": "CC BY 4.0, attribute What Agents Buy",
+               "measured_at": _LAB_ASOF, "entries": _n_graded, "distinct_sellers": _n_lab_hosts,
+               "count_note": ("entries counts host-category rows; one seller graded in two categories is two "
+                              "entries and one distinct seller. measured_at is when the calls were made, "
+                              "generated is when this file was written."),
                "what": ("Per-category accuracy corpus: every seller in an objective category, paid and graded "
                         "against a primary source (exchange median, FMP, the ECB, the chain, a weather model), "
                         "ranked by deviation then price. verdict is accurate or off; sellers that returned no "
@@ -3555,11 +3640,6 @@ if _LAB:
 # service with two grades had them at two unrelated URLs and no home. This page
 # collects every grade, every receipt and the live settlement figures in one
 # place, and it gets stronger each time the same service is rated again.
-_svc_posts = {}
-for _p in FEED:
-    _nm = (_p.get("api") or {}).get("name")
-    if is_host(_nm) and _p.get("grade"):
-        _svc_posts.setdefault(_nm, []).append(_p)
 
 # What each host actually sells, and what the registry claims about it. All of
 # this was already on disk and none of it was on the page, which left the one URL
@@ -3621,14 +3701,20 @@ def _svc_trend(addr):
     return out
 
 
-for _host, _plist in _svc_posts.items():
-    _plist = sorted(_plist, key=lambda x: grade_rank(x.get("grade")))
+# Pages used to exist only for hosts holding an editorial grade, while the
+# accuracy table linked every host it measured: four of the five featured
+# "cheapest accurate" recommendations 404'd (2026-09-09 evaluation, W1). The
+# rule is now: a host gets a page when we hold PAID evidence on it, which is a
+# grade, an accuracy result, a delivery check, or a receipt. Hosts we merely
+# swept or listed do not; search sends those to the seller's own site.
+for _host in _SVC_PAGE_HOSTS:
+    _plist = sorted(_svc_posts.get(_host, []), key=lambda x: grade_rank(x.get("grade")))
     _lb_row = None
     if LB:
         _lb_row = next((r for r in LB["windows"]["1d"]["rows"] if r["host"] == _host), None)
     _grades = [x["grade"] for x in _plist]
     _chips = "".join(f'<span class="g g{g[0]}">{html.escape(g)}</span>' for g in _grades)
-    _desc = (SERVICES.get(_host, {}) or {}).get("desc") or (_plist[0].get("endpoint") or "")
+    _desc = (SERVICES.get(_host, {}) or {}).get("desc") or ((_plist[0].get("endpoint") or "") if _plist else "")
     # Seller descriptions arrive with newlines collapsed, so a markdown heading
     # shows up inline as "... no subscriptions. ## No wallet?". Cut at the heading.
     _desc = re.split(r"\s*#{1,6}\s|\n\n", _desc)[0].strip().rstrip(".").strip()
@@ -3642,9 +3728,15 @@ for _host, _plist in _svc_posts.items():
                    ("Paying wallets", str(_lb_row["payers"]))]
         if _lb_row.get("avg_ticket"):
             _facts.append(("Average ticket", f'${_lb_row["avg_ticket"]:,.4f}'))
-    _paid = [x for x in _plist if (x.get("verdict") or {}).get("charged")]
-    if _paid:
-        _facts.append(("Times bought from", str(len(_paid))))
+    # "Times bought from" counted editorial posts with a charge, so BlockRun read
+    # "1" beside two paid receipts (2026-09-09 evaluation, D3). Count the receipts
+    # the page itself shows, and keep reviews as their own number.
+    _paid_calls = [r for r in _RECEIPTS_BY_HOST.get(_host, [])
+                   if (r.get("payment") or {}).get("paid") or (r.get("payment") or {}).get("charged_usdc")]
+    if _paid_calls:
+        _facts.append(("Paid calls recorded", str(len(_paid_calls))))
+    if _plist:
+        _facts.append(("Reviews", str(len(_plist))))
     _facts_html = ("".join(f'<div><b>{html.escape(v)}</b><span>{html.escape(k)}</span></div>'
                            for k, v in _facts))
 
@@ -3780,6 +3872,30 @@ for _host, _plist in _svc_posts.items():
             f'<div class="rcpt-grid">{"".join(_receipt_card(r) for r in _shown)}</div>'
             f'<p class="note dim">The full record and the format are at <a href="/receipts">/receipts</a>.</p>')
 
+    # --- accuracy against a primary source (the lab), dated ---------------------
+    _acc_html = ""
+    _lrows = _LAB_BY_HOST.get(_host, [])
+    if _lrows:
+        _aitems = []
+        for _r in _lrows:
+            _aok = abs(_r.get("dev") or 0) <= _r["_tol"]
+            _atag = '<span class="dgood">accurate</span>' if _aok else '<span class="dbad">off</span>'
+            _aoff = (("%+g " % _r["dev"]) + _r["_unit"]) if _r.get("dev") is not None else "&mdash;"
+            _aq = _r.get("quoted")
+            _aprice = f'${_aq:g}/call' if _aq is not None else 'price not recorded'
+            _atx = (f' &middot; <a href="https://basescan.org/tx/{html.escape(_r["tx"])}">tx</a>'
+                    if _r.get("tx") else "")
+            _aitems.append(
+                f'<li>{_atag} <b>{html.escape(_CAT_TITLES.get(_r["_cat"], _r["_cat"]))}</b>: returned '
+                f'{html.escape(str(_r.get("value")))}, off by {_aoff} against '
+                f'{html.escape(str(_r["_source"] or "the reference"))} &middot; {_aprice}{_atx}</li>')
+        _acc_html = (
+            f'<h3 class="svch3">Accuracy against a primary source</h3>'
+            f'<ul class="dlist">{"".join(_aitems)}</ul>'
+            f'<p class="note dim">Measured {_LAB_ASOF or "on the date in /api/categories.json"} by paying this '
+            f'seller and comparing the number it returned with a source it cannot resell. A dated sample, not a '
+            f'live guarantee. Full corpus at <a href="/categories">/categories</a>.</p>')
+
     # --- Preflight verdict: the pre-payment oracle for this host --------------
     _pf = _GREENLIGHT.get(_host)
     _pf_html = ""
@@ -3812,7 +3928,10 @@ for _host, _plist in _svc_posts.items():
              f'<p class="svcdesc">{html.escape(_desc[:240])}</p></div></div>'
              + _pf_html
              + (f'<div class="statcard svcfacts">{_facts_html}</div>' if _facts else "")
-             + f'<h3 class="svch3">Every rating</h3>{"".join(_rows)}'
+             + (f'<h3 class="svch3">Every rating</h3>{"".join(_rows)}' if _rows else
+                '<h3 class="svch3">Grades</h3><p class="svcline dim">No purchase-based grade yet. Everything '
+                'below was measured, by paying this seller or by sweeping the chain, and none of it is editorial.</p>')
+             + _acc_html
              + _demand_html + _delivery_html + _receipts_html + _sells_html + _trend_html + _claim_html + _meta_html
              + '<p class="note dim" style="margin-top:18px">Grades here come from paying this service and '
                'recording what happened, or from calling it where it is free. Settlement figures are swept '
@@ -3820,9 +3939,21 @@ for _host, _plist in _svc_posts.items():
              + '<p class="note" style="margin-top:14px"><a href="/ratings">All ratings</a> &middot; '
                '<a href="/leaderboard">Top paid services</a> &middot; <a href="/">Latest</a></p></article>')
 
-    _t = f'{_host}: {"/".join(_grades)} on x402 | What Agents Buy'
-    _d = (f'{_host} graded {" and ".join(_grades)} after paying it directly. '
-          f'{_desc[:110]} What was quoted, what was actually charged, and whether the goods arrived.')
+    if _grades:
+        _t = f'{_host}: {"/".join(_grades)} on x402 | What Agents Buy'
+        _d = (f'{_host} graded {" and ".join(_grades)} after paying it directly. '
+              f'{_desc[:110]} What was quoted, what was actually charged, and whether the goods arrived.')
+    else:
+        _what = []
+        if _lrows:
+            _what.append("accuracy measured against a primary source")
+        if _dchecks:
+            _what.append("delivery checked against its own schema")
+        if _hrs:
+            _what.append(f'{len(_hrs)} paid receipt{"s" if len(_hrs) != 1 else ""}')
+        _t = f'{_host}: measured on x402, not yet graded | What Agents Buy'
+        _d = (f'{_host} on x402: {", ".join(_what) or "settlement swept from chain"}. {_desc[:100]} '
+              f'No editorial grade yet; everything here was measured by paying it or sweeping the chain.')
     _svc_ld = json.dumps([
         {"@context": "https://schema.org", "@type": "WebAPI", "name": _host,
          "url": f"https://{_host}", "description": _desc[:300],
@@ -3836,7 +3967,8 @@ for _host, _plist in _svc_posts.items():
         json.loads(crumbs(("Home", "/"), ("Ratings", "/ratings"), (_host, f"/s/{_host}")))],
         separators=(",", ":"))
     write(f"s/{_host}/index.html", site_page(f"/s/{_host}", _t, _d, _body, ld=_svc_ld))
-    urls.append(f"/s/{_host}")
+    if _host in _SVC_SITEMAP_SET:
+        urls.append(f"/s/{_host}")
 
 # Remove permalink pages for posts and notes that no longer exist. Without this,
 # unpublishing something leaves it reachable at its old URL.
@@ -3897,13 +4029,13 @@ _ll = [f"# What Agents Buy", "",
        f"Live dashboard: {SITE}/x402 — x402 volume and payment counts (24h, day-over-day and a "
        f"seven-day series), USDC and total stablecoin circulation, Base sequencer fees. Read from "
        f"chain, refreshed continuously. JSON: {SITE}/api/dashboard (no key, CORS open).",
-       f"MCP server (free, no key): {SITE}/mcp — 7 tools. Which for which job: find_api (find an API for a task), "
+       f"MCP server (free, no key): {SITE}/mcp — {MCP_TOOL_COUNT} tools. Which for which job: find_api (find an API for a task), "
        f"check_before_paying (the pre-pay CLEAR/HOLD/ABORT verdict), look_up_seller (one seller's full record), "
        f"rank_sellers (leaderboard by revenue or real_demand), rank_by_accuracy (a category by graded accuracy), "
        f"market_size (how big x402 is), known_payment_traps (how agents lose money). Old names still resolve.",
        f"  claude mcp add --transport http whatagentsbuy {SITE}/mcp",
        "Integrate: give your agent one rule, \"call preflight(url) before paying any x402 API and gate on the "
-       "light\". Full drop-in recipe: https://github.com/neilkpatel/whatagentsbuy/blob/main/llms-install.md", ""]
+       "verdict field (CLEAR / HOLD / ABORT / UNRATED); light is the same verdict as a colour\". Full drop-in recipe: https://github.com/neilkpatel/whatagentsbuy/blob/main/llms-install.md", ""]
 if LB:
     _w = LB["windows"]["1d"]
     _ll += ["## The market, last 24 hours", "",
@@ -4250,10 +4382,14 @@ if _pr:
     _si = []
     for _h, _a in _agg.items():
         _graded = bool(_a["grades"])
-        _measured = (not _graded) and (_a["delivered"] is not None or _h in _lb_hosts)
+        _measured = (not _graded) and (_a["delivered"] is not None or _h in _lb_hosts or _h in _SVC_PAGE_SET)
         _status = "graded" if _graded else ("measured" if _measured else "listed")
         _si.append({"t": "host", "label": _h,
-                    "url": (f"/s/{_h}" if _graded else None),
+                    # A result with nowhere to go rendered as an unclickable option
+                    # (2026-09-09 evaluation, W2). Hosts we hold evidence on open their
+                    # page; the rest open the seller's own site, labelled as external.
+                    "url": (f"/s/{_h}" if _h in _SVC_PAGE_SET else f"https://{_h}"),
+                    "external": _h not in _SVC_PAGE_SET,
                     "status": _status,
                     "grade": (_a["grades"][0] if _a["grades"] else None),
                     "price": _a["price"], "rel": _a["rel"], "n": _a["n"],
@@ -4282,12 +4418,36 @@ if _pr:
               separators=(",", ":"))
     globals()["_SEARCH_COUNT"] = len(_si)
 
+# The scope every headline figure carries: chains, universe, window, attribution,
+# and the payment-method caveat. Machine summaries were losing this (2026-09-09
+# evaluation, D1): market_size described Base JSON-RPC while its total folded in
+# Solana. One object, written into every feed and passed through the MCP.
+_SCOPE = {
+    "chains": ["base", "solana"],
+    "token": "USDC",
+    "universe": "sellers whose payTo address we collected from their own x402 payment challenge",
+    "attribution": ("a USDC Transfer into an advertised payTo. The log sender is the buyer that signed the "
+                    "EIP-3009 authorization; the transaction submitter is a facilitator."),
+    "window": {"basis": "rolling 24h at sweep time, one sweep per day",
+               "as_of": LB["last_day"] if LB else None},
+    "tape": {"from": LB["first_day"] if LB else None, "to": LB["last_day"] if LB else None},
+    "revenue_measured_on": ["base", "solana"],
+    "demand_shape_measured_on": "base",
+    "payment_method_caveat": ("a payTo is an address, and not every USDC transfer into it is an x402 payment. "
+                              "Payment COUNTS are almost entirely x402 (EIP-3009 transferWithAuthorization). "
+                              "DOLLAR totals also include ordinary transfers that landed on the same wallets, "
+                              "and a handful of large ones can dominate a day. Treat counts as the firmer figure."),
+    "measured_at": NOW_ISO,
+}
 if LB:
     _w = LB["windows"]["1d"]
     json.dump({"generated": NOW_ISO, "source": SITE,
                "license": "CC BY 4.0, attribute What Agents Buy",
-               "method": ("USDC Transfer logs swept daily from Base JSON-RPC into the payTo address each service "
-                          "advertises in its own x402 challenge. Registry call-counters are not used."),
+               "scope": _SCOPE,
+               "method": ("USDC Transfer logs into the payTo address each service advertises in its own x402 "
+                          "challenge, swept daily from Base JSON-RPC, with Solana inflow folded into "
+                          "usdc_received and settlements. Demand-shape fields are Base only. Registry "
+                          "call-counters are not used."),
                "window": "24h", "as_of": LB["last_day"],
                "tape_from": LB["first_day"], "tape_to": LB["last_day"],
                "total_usdc": _w["total_usdc"], "total_settlements": _w["total_settlements"],
@@ -4338,6 +4498,11 @@ if LB:
             return b if b is not None else (r.get("usdc") or 0)
         total = sum(_base_usd(r) for r in rows) or 1.0
         wash = sum(_base_usd(r) for r in rows if _fails_organic(r))
+        # A host can settle into more than one payment wallet, and each wallet is
+        # scored on its own because buyer concentration is a property of a wallet.
+        # Two rows for one host looked like double counting with nothing to tell
+        # them apart (2026-09-09 evaluation, D2): name the wallet and say so.
+        _hc = collections.Counter(x.get("host") for x in scored)
         out = []
         for i, r in enumerate(scored, 1):
             mr = vrank[id(r)]
@@ -4352,6 +4517,12 @@ if LB:
                 "top_buyer_share": r.get("top_payer_share"),
                 # inflated: much higher by money than by real demand; the wash signal
                 "inflated": (i - mr) >= 5,
+                "payment_wallet": r.get("address"),
+                "chains": sorted((r.get("chains") or {}).keys()),
+                "demand_measured_on": r.get("demand_measured_on"),
+                "note": ("this host settles into more than one payment wallet; each wallet is scored "
+                         "separately because buyer concentration is a property of a wallet, not of a brand"
+                         if _hc[r.get("host")] > 1 else None),
             })
         return {"wash_share_pct": round(wash / total * 100, 1),
                 "wash_scope": "base-measured dollars only; Solana inflow is excluded because concentration is not swept there",
@@ -4360,10 +4531,13 @@ if LB:
     json.dump({
         "generated": NOW_ISO, "source": SITE,
         "license": "CC BY 4.0, attribute What Agents Buy",
+        "scope": _SCOPE,
         "what": ("The x402 leaderboard re-ranked by Organic Demand Score (the shape of the money) instead of "
                  "raw settled volume (the number a wash trader inflates). Each service carries both its demand "
-                 "rank and its money rank; a large positive rank_gap means the volume "
-                 "flatters it. A low score is a flag, not a verdict: one large genuine customer looks identical "
+                 "rank and its money rank. rank_gap = money_rank - demand_rank: a large POSITIVE gap means it "
+                 "ranks far better by real demand than by dollars (underrated by money); a large NEGATIVE gap "
+                 "means the volume flatters it, which is what the inflated flag marks. A low score is a flag, "
+                 "not a verdict: one large genuine customer looks identical "
                  "to a wallet paying itself. Read organic_demand_score beside top_buyer_share, never alone."),
         "score_method": ("0-100 from breadth (distinct paying wallets, up to 40), spread (dollar dispersion via "
                          "1 - HHI, up to 40), and repeat (share of buyers who returned, up to 20). Revenue and "

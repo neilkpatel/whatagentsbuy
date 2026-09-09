@@ -41,10 +41,18 @@ is nothing to install and nothing to run.
 Add this to your agent's system prompt:
 
 > Before paying any x402 / HTTP 402 API, call `preflight(url)` on the whatagentsbuy
-> MCP and gate on the light: **CLEAR** = safe to pay, **HOLD** = resolve the reasons
+> MCP and gate on its `verdict` field: **CLEAR** = safe to pay, **HOLD** = resolve the reasons
 > first, **ABORT** = do not pay without checking the live 402, **UNRATED** = unproven.
 > Whatever it says, always read the `payTo` and amount out of the live 402 response
 > and sign against those, never against a listing.
+
+`verdict` is the machine field, one of `CLEAR` / `HOLD` / `ABORT` / `UNRATED`. `light` is
+the same decision as a colour (`green` / `yellow` / `red` / `gray`) for display; never
+compare `light` to `ABORT`. Every response also carries `confidence` (`verified` /
+`checked` / `unproven`) and `as_of`; a complete policy uses all three. The full decision
+table, including malformed responses, outages and stale evidence, is at
+https://whatagentsbuy.com/api#decision. (Before 2026-09-09 this note said "gate on the
+light", which produced guards that could never fire; if you copied it, switch to `verdict`.)
 
 ## 3. The loop
 

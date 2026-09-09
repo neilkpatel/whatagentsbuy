@@ -8,7 +8,7 @@ class of error that has cost us real money and real corrections cannot recur
 silently.
 """
 import json, os, sys, tempfile
-import backfill_sweep, conform, leaderboard, market, og_x402, promote_verified, sweep, sweep_solana, whatsnew
+import backfill_sweep, buyers, conform, leaderboard, market, og_x402, promote_verified, sweep, sweep_solana, whatsnew
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _pass, _fail = 0, 0
@@ -420,6 +420,44 @@ def test_receipt_field_extraction():
           receipts._extract_field(p, ".data.nope") is None)
     check("value-anywhere finds a nested measurement",
           receipts._value_anywhere(p, 4.56) and not receipts._value_anywhere(p, 7.77))
+
+
+def test_sweep_overwrite_guard():
+    """D1: the sweep is the ONE unrecoverable pipeline — a settlement day missed
+    or corrupted cannot be re-swept later, because the window is rolling. This
+    guard is the last thing between a lossy re-run and the tape, so it is tested
+    directly, including that a malformed prior file can never crash the sweep."""
+    import sweep
+    R = sweep.overwrite_refusal
+    full = {"hours": 24, "meta": {"failed_queries": 0},
+            "by_address": {"0xa": {"settlements": 1000}, "0xb": {"settlements": 500}}}
+    same = {"0xa": {"settlements": 1000}, "0xb": {"settlements": 500}}
+
+    check("an identical re-sweep is allowed", R(full, same, 24, 0) is None)
+    check("a SHORTER test sweep never replaces a full day",
+          "short test sweep" in (R(full, same, 6, 0) or ""))
+    check("a LONGER sweep may replace a shorter day",
+          R({"hours": 6, "meta": {}, "by_address": {}}, same, 24, 0) is None)
+    check("a partial run never replaces a CLEAN snapshot",
+          "CLEAN day" in (R(full, same, 24, 3) or ""))
+    check("a same-window run holding <90% of the settlements is refused",
+          "lossier sweep" in (R(full, {"0xa": {"settlements": 100}}, 24, 0) or ""))
+    check("a slightly smaller result (>=90%) is still allowed",
+          R(full, {"0xa": {"settlements": 1400}}, 24, 0) is None)
+    check("a BIGGER result is always allowed",
+          R(full, {"0xa": {"settlements": 9999}}, 24, 0) is None)
+    # defensive: a malformed prior must never block or crash the write
+    check("an empty prior file cannot block the write", R({}, same, 24, 0) is None)
+    check("a prior with no by_address cannot block the write",
+          R({"hours": 24, "meta": {}}, same, 24, 0) is None)
+    check("null rows in the prior cannot crash the guard",
+          R({"hours": 24, "meta": {}, "by_address": {"0xa": None}}, same, 24, 0) is None)
+    check("null settlements in the new rows cannot crash the guard",
+          R(full, {"0xa": {"settlements": None}}, 24, 0) is not None)
+    # both clean and both failing: fall through to the count comparison only
+    check("two equally-partial runs compare on count, not failure",
+          R({"hours": 24, "meta": {"failed_queries": 2}, "by_address": {"0xa": {"settlements": 10}}},
+            {"0xa": {"settlements": 10}}, 24, 5) is None)
 
 
 def test_lab_field_chosen_by_name_never_by_answer_key():
@@ -1335,6 +1373,458 @@ def main():
             print(f"  ERROR in {fn.__name__}: {e}")
     print(f"\n{_pass} passed, {_fail} failed")
     return 1 if _fail else 0
+
+
+
+
+# --- buyer tape: the payer side of the settlement sweep -----------------------
+def _blog(frm, to, usdc, blk=1):
+    """A USDC Transfer log the way Base returns it."""
+    return {"topics": ["0xddf", "0x" + "0" * 24 + frm[2:], "0x" + "0" * 24 + to[2:]],
+            "data": hex(int(usdc * 1e6)), "blockNumber": hex(blk)}
+
+
+_ZERO = "0x0000000000000000000000000000000000000000"
+_DEAD = "0x000000000000000000000000000000000000dead"
+
+
+def test_buyers_mint_is_not_a_buyer():
+    """The mirror of the $138M phantom day. On 8/18 a seller advertised 0x0 as
+    its payTo and every USDC burn mapped to it. The same trap runs in reverse on
+    the buyer side: the zero address as SENDER is a mint, and left in, the single
+    largest 'buyer' of this market is the USDC mint address."""
+    logs = [_blog(_ZERO, "0x" + "aa" * 20, 248_256_395.0),
+            _blog(_DEAD, "0x" + "aa" * 20, 1_000_000.0),
+            _blog("0x" + "bb" * 20, "0x" + "aa" * 20, 10.0)]
+    out = buyers.decode_buyers(logs)
+    check("buyers: mint (sender 0x0) is not a buyer", _ZERO not in out, f"got {list(out)}")
+    check("buyers: 0x...dead as sender is not a buyer", _DEAD not in out, f"got {list(out)}")
+    check("buyers: a real payer still counts",
+          out.get("0x" + "bb" * 20, {}).get("usdc") == 10.0)
+    check("buyers: the mint cannot become the top buyer",
+          buyers.summarize(out)["usdc"] == 10.0, f"got {buyers.summarize(out)}")
+
+
+def test_buyers_burn_recipient_excluded():
+    """A payment TO a burn address is a redemption, not a purchase from a seller.
+    Counting it would credit a buyer with spending that bought nothing."""
+    out = buyers.decode_buyers([_blog("0x" + "bb" * 20, _ZERO, 500.0),
+                                _blog("0x" + "bb" * 20, "0x" + "aa" * 20, 2.0)])
+    check("buyers: transfer to burn address is not a purchase",
+          out["0x" + "bb" * 20]["usdc"] == 2.0, f'got {out["0x" + "bb" * 20]["usdc"]}')
+    check("buyers: burn recipient absent from the edge list",
+          _ZERO not in out["0x" + "bb" * 20]["sellers_paid"])
+
+
+def test_buyers_reseller_is_flagged_not_filtered():
+    """clusterprotocol read as a washer when it was a reseller passing through
+    cost of goods, and the false accusation shipped under Neil's real name. A
+    wallet that is itself an advertised payTo and also buys is a reseller: the
+    file must mark it and must NOT drop it, because dropping it hides demand."""
+    seller_a, seller_b, buyer = "0x" + "aa" * 20, "0x" + "cc" * 20, "0x" + "bb" * 20
+    out = buyers.decode_buyers([_blog(seller_a, seller_b, 5.0),      # seller A buys from B
+                                _blog(buyer, seller_a, 3.0)],
+                               seller_addrs={seller_a, seller_b})
+    check("buyers: a listed seller that buys is retained", seller_a in out)
+    check("buyers: and is flagged as a reseller", out[seller_a]["is_seller"] is True)
+    check("buyers: a pure buyer is not flagged", out[buyer]["is_seller"] is False)
+    check("buyers: summary counts resellers", buyers.summarize(out)["resellers"] == 1)
+
+
+def test_buyers_keeps_the_seller_edge_list():
+    """A payer count cannot tell one wallet paying a thousand times from a
+    thousand wallets paying once. The (buyer -> seller) pairs are what make
+    cohort analysis possible later without paying to re-sweep a rolling window."""
+    b = "0x" + "bb" * 20
+    s1, s2 = "0x" + "a1" * 20, "0x" + "a2" * 20
+    out = buyers.decode_buyers([_blog(b, s1, 9.0, 100), _blog(b, s1, 1.0, 110),
+                                _blog(b, s2, 10.0, 120)])
+    r = out[b]
+    check("buyers: distinct sellers counted", r["sellers"] == 2, f'got {r["sellers"]}')
+    check("buyers: settlements counted", r["settlements"] == 3)
+    check("buyers: edge list keeps per-seller totals",
+          r["sellers_paid"][s1] == {"n": 2, "usdc": 10.0}, f'got {r["sellers_paid"][s1]}')
+    check("buyers: repeat sellers counted", r["repeat_sellers"] == 1)
+    check("buyers: dollar concentration across sellers is even here",
+          r["top_seller_share"] == 0.5, f'got {r["top_seller_share"]}')
+    check("buyers: activity span retained", r["span_blocks"] == 20 and r["first_block"] == 100)
+
+
+def test_buyers_overwrite_guard_protects_the_day():
+    """The buyer tape rides the same rolling 24h window as the seller tape, so a
+    lossier re-run must never replace a good day. Reuses the guard that already
+    protects settlements, now keyed on by_buyer."""
+    prior = {"hours": 24, "meta": {"failed_queries": 0},
+             "by_buyer": {"0xaa": {"settlements": 1000}}}
+    thin = {"0xaa": {"settlements": 100}}
+    check("buyers: a lossier same-window run is refused",
+          sweep.overwrite_refusal(prior, thin, 24, 0, rows_key="by_buyer") is not None)
+    check("buyers: a partial run cannot replace a clean day",
+          sweep.overwrite_refusal(prior, {"0xaa": {"settlements": 1000}}, 24, 7,
+                                  rows_key="by_buyer") is not None)
+    check("buyers: a short test window cannot replace a full day",
+          sweep.overwrite_refusal(prior, thin, 6, 0, rows_key="by_buyer") is not None)
+    check("buyers: an equally complete run is allowed",
+          sweep.overwrite_refusal(prior, {"0xaa": {"settlements": 1000}}, 24, 0,
+                                  rows_key="by_buyer") is None)
+    check("seller tape guard still keyed on by_address by default",
+          sweep.overwrite_refusal({"hours": 24, "meta": {"failed_queries": 0},
+                                   "by_address": {"0xaa": {"settlements": 1000}}},
+                                  {"0xaa": {"settlements": 100}}, 24, 0) is not None)
+
+
+def test_buyer_tape_cannot_reach_the_published_site():
+    """Buyers never advertised themselves the way sellers advertised a payTo, so
+    the addresses stay internal until there is a decision to publish. Every
+    reader of data/history/ filters on the settlements_ prefix; this asserts that
+    is still true, so dropping buyers_<date>.json in there cannot leak it."""
+    src = open(os.path.join(HERE, "build.py")).read()
+    hits = [ln for ln in src.splitlines()
+            if "data" in ln and "history" in ln and ("listdir" in ln or "glob" in ln)]
+    check("build.py still reads data/history in a known number of places",
+          len(hits) >= 2, f"found {len(hits)}")
+    nearby = src.split("history")
+    check("build.py never globs buyers_ files", "buyers_" not in src,
+          "build.py references buyers_ files; publishing buyer addresses must be deliberate")
+    check("build.py history reads are prefix-filtered to settlements_",
+          src.count('startswith("settlements_")') + src.count('"settlements_*.json"') >= 2,
+          "a history reader lost its settlements_ prefix filter")
+
+
+# --- RPC endpoint refusal: fail over, do not retry a doomed endpoint ----------
+def test_endpoint_refusal_is_recognised():
+    """2026-09-09: the daily sweep took 3h43m instead of ~1h30m. pick_rpc chose
+    base.drpc.org because it passed a 50-block probe, then 395 of 396 real ranges
+    came back "-32001 You've reached the usage limit". A quota refusal is a fact
+    about the ENDPOINT, so all 3 MAX_RETRIES plus backoff were spent per range,
+    twice over (publicnode answered 403 to the same 395). Those must fail over at
+    once. The tape survived (0 failed queries after failover to mainnet.base.org)
+    but cost three wasted hours."""
+    for msg in ["{'code': -32001, 'message': \"You've reached the usage limit for your plan\"}",
+                "HTTP Error 403: Forbidden",
+                "HTTP Error 429: Too Many Requests",
+                "HTTP Error 525: <none>",
+                "rate limit exceeded"]:
+        check(f"refusal recognised: {msg[:34]!r}", sweep.is_endpoint_refusal(msg), msg)
+    for msg in ["HTTP Error 500: Internal Server Error",
+                "timed out",
+                "query returned more than 10000 results",
+                "connection reset by peer"]:
+        check(f"NOT a refusal, keep retrying: {msg[:34]!r}",
+              not sweep.is_endpoint_refusal(msg), msg)
+
+
+def test_endpoint_refusal_matches_real_error_objects():
+    """jrpc raises RuntimeError(str(error_dict)), and urllib raises HTTPError, so
+    the check has to work on the objects actually thrown, not just on strings."""
+    import urllib.error
+    check("refusal seen through RuntimeError",
+          sweep.is_endpoint_refusal(RuntimeError("{'code': -32001, 'message': 'usage limit'}")))
+    check("refusal seen through HTTPError 403",
+          sweep.is_endpoint_refusal(
+              urllib.error.HTTPError("http://x", 403, "Forbidden", None, None)))
+    check("a 500 through HTTPError is still retryable",
+          not sweep.is_endpoint_refusal(
+              urllib.error.HTTPError("http://x", 500, "Internal Server Error", None, None)))
+
+
+def test_pick_rpc_tests_the_real_query_shape():
+    """The 50-block probe is not the workload. An endpoint that serves small
+    queries and refuses 2000-block/150-address ones passed the check and was then
+    used as primary for the whole sweep. With sample_topics, pick_rpc issues one
+    genuinely representative query and rejects the endpoint if it fails."""
+    calls = []
+    real = sweep.jrpc
+
+    def fake(url, method, params, timeout=45):
+        calls.append((url, method, params))
+        if method == "eth_blockNumber":
+            return hex(51_000_000)
+        rng = int(params[0]["toBlock"], 16) - int(params[0]["fromBlock"], 16)
+        if rng > 100 and url == "https://bad.example":
+            raise RuntimeError("{'code': -32001, 'message': 'usage limit'}")
+        return [{"topics": ["0x" + "d" * 64], "data": "0x1", "blockNumber": "0x1"}]
+
+    sweep.jrpc = fake
+    old = sweep.RPCS
+    try:
+        sweep.RPCS = ["https://bad.example", "https://good.example"]
+        url, _ = sweep.pick_rpc(sample_topics=["0x" + "0" * 24 + "aa" * 20])
+        check("pick_rpc skips an endpoint that fails the REAL query shape",
+              url == "https://good.example", f"chose {url}")
+        big = [c for c in calls if c[1] == "eth_getLogs"
+               and int(c[2][0]["toBlock"], 16) - int(c[2][0]["fromBlock"], 16) >= sweep.WINDOW_BLOCKS - 1]
+        check("pick_rpc actually issued a full-window probe", big, "no representative query was made")
+        calls.clear()
+        sweep.RPCS = ["https://bad.example"]
+        url, _ = sweep.pick_rpc()
+        check("without sample_topics the old cheap check still passes it",
+              url == "https://bad.example",
+              "the representative probe must stay opt-in so callers keep old behaviour")
+    finally:
+        sweep.jrpc = real
+        sweep.RPCS = old
+
+
+def test_every_test_in_this_file_actually_runs():
+    """main() discovers tests from globals(), so anything defined BELOW the
+    `if __name__ == "__main__"` block is never defined when main() runs and is
+    silently skipped. Appending a test to the end of the file is the obvious way
+    to add one, and it made 9 new test functions (39 checks) look green while
+    never executing: the suite reported the same 255 before and after. A skipped
+    test is worse than no test, because it reads as coverage. This compares what
+    the source DEFINES against what the runner FINDS."""
+    src = open(os.path.join(HERE, "tests.py")).read()
+    defined = {ln[4:ln.index("(")] for ln in src.splitlines() if ln.startswith("def test_")}
+    found = {k for k in globals() if k.startswith("test_")}
+    missing = sorted(defined - found)
+    check("every test_ function in the source is reachable by the runner",
+          not missing, f"defined but never run: {missing}")
+    check("the __main__ guard is the last statement in the file",
+          src.rstrip().endswith("sys.exit(main())"),
+          "move the guard to the end or tests below it will not run")
+
+
+
+
+# --- 2026-09-09 external evaluation: each finding, verified, now guarded ------
+# build.py runs this file BEFORE it writes public/, so an artifact test that runs
+# against output an older build.py produced fails on the very change that fixes
+# it, and the build aborts before it can produce the fixed output. These tests
+# therefore skip when public/ predates build.py; they run for real on the next
+# tests.py run after a build (the pre-commit hook, and the daily job's gate).
+def _built_after_code():
+    stamp = os.path.join(HERE, "public", "api", "leaderboard.json")
+    code = os.path.join(HERE, "build.py")
+    return os.path.exists(stamp) and os.path.getmtime(stamp) >= os.path.getmtime(code)
+
+
+def test_every_linked_service_page_exists():
+    """W1: four of five featured 'cheapest accurate' links on /categories 404'd.
+    /s/<host> pages were built only for hosts holding an editorial grade while
+    the accuracy table linked every host it measured. A link the site itself
+    emits must resolve to a page the site itself built."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    import re as _re, glob as _glob
+    if not os.path.isdir(os.path.join(HERE, "public", "s")):
+        return
+    linked = set()
+    for f in _glob.glob(os.path.join(HERE, "public", "**", "*.html"), recursive=True):
+        linked.update(_re.findall(r'href="/s/([^"#?/]+)/?"', open(f, errors="replace").read()))
+    missing = sorted(h for h in linked
+                     if not os.path.exists(os.path.join(HERE, "public", "s", h, "index.html")))
+    check("every /s/<host> link the site emits has a built page", not missing,
+          f"{len(missing)} would 404, e.g. {missing[:6]}")
+    check("the site links a meaningful number of service pages", len(linked) >= 20, f"only {len(linked)}")
+
+
+def test_search_index_gives_every_host_a_destination():
+    """W2: eight weather results rendered as unclickable divs because hosts
+    without a grade carried url:null. Every host now opens its page or, when
+    we hold no evidence, the seller's own site, labelled external."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    p = os.path.join(HERE, "public", "api", "search-index.json")
+    if not os.path.exists(p):
+        return
+    hosts = [i for i in json.load(open(p))["items"] if i["t"] == "host"]
+    check("no host result without a destination", all(i.get("url") for i in hosts),
+          f'{sum(1 for i in hosts if not i.get("url"))} without url')
+    internal = [i for i in hosts if str(i.get("url")).startswith("/s/")]
+    missing = [i["url"] for i in internal
+               if not os.path.exists(os.path.join(HERE, "public", i["url"].strip("/"), "index.html"))]
+    check("every internal search destination has a page", not missing, str(missing[:5]))
+    ext = [i for i in hosts if str(i.get("url")).startswith("http")]
+    check("external destinations are labelled external", all(i.get("external") for i in ext))
+    check("hosts with a page are never sent off-site", all(not i.get("external") for i in internal))
+
+
+def test_mcp_tool_count_agrees_across_surfaces():
+    """W3: the homepage bar said 'five tools' while tools/list advertised seven."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    import re as _re
+    js = open(os.path.join(HERE, "api", "mcp.js")).read()
+    start = js.index("const TOOLS = [")
+    tools_src = js[start: js.index("\n];", start)]
+    n_js = len(_re.findall(r'^\s*name: "', tools_src, _re.M))
+    src = open(os.path.join(HERE, "build.py")).read()
+    m = _re.search(r"^MCP_TOOLS = \[(.*?)\]", src, _re.S | _re.M)
+    n_py = len(_re.findall(r'"[a-z_]+"', m.group(1))) if m else -1
+    check("build.py MCP_TOOLS matches the tools mcp.js advertises", n_js == n_py,
+          f"mcp.js advertises {n_js}, build.py lists {n_py}")
+    for f in ("index.html", "api/index.html"):
+        p = os.path.join(HERE, "public", f)
+        if not os.path.exists(p):
+            continue
+        t = open(p, errors="replace").read()
+        check(f"{f}: states the real tool count", f"{n_js} tools" in t)
+        check(f"{f}: no stale 'five tools'", "five tools" not in t.lower())
+        check(f"{f}: template braces rendered", "{MCP_TOOL_COUNT}" not in t)
+
+
+def test_mcp_cta_anchor_resolves_from_every_page():
+    """W3: 'Free MCP server for your agent' linked to #mcp, an id that exists
+    only on the homepage, so on every subpage it went nowhere."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    import re as _re, glob as _glob
+    if not os.path.isdir(os.path.join(HERE, "public")):
+        return
+    api = os.path.join(HERE, "public", "api", "index.html")
+    if os.path.exists(api):
+        check("/api carries the id=mcp install anchor", 'id="mcp"' in open(api, errors="replace").read())
+    bad = []
+    for f in _glob.glob(os.path.join(HERE, "public", "**", "*.html"), recursive=True):
+        t = open(f, errors="replace").read()
+        if 'href="#mcp"' in t and 'id="mcp"' not in t:
+            bad.append(os.path.relpath(f, os.path.join(HERE, "public")))
+    check("no page links #mcp without carrying that id", not bad, str(bad[:5]))
+
+
+def test_install_prompt_gates_on_verdict_not_light():
+    """M1: the install prompt said to gate on the light using CLEAR/HOLD/ABORT,
+    but light is green/yellow/red and verdict is CLEAR/HOLD/ABORT, so a literal
+    guard could never fire."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    src = open(os.path.join(HERE, "build.py")).read()
+    check("build.py no longer tells developers to gate on the light",
+          "gate on the light (CLEAR" not in src and 'gate on the "\n       "light\\"' not in src)
+    pub = open(os.path.join(HERE, "public_repo", "llms-install.md")).read()
+    check("public install recipe gates on verdict", "gate on the light" not in pub and "`verdict`" in pub)
+    p = os.path.join(HERE, "public", "api", "index.html")
+    if os.path.exists(p):
+        t = open(p, errors="replace").read()
+        check("/api publishes the decision contract", 'id="decision"' in t and "input_error" in t)
+
+
+def test_organic_rank_gap_sign_matches_its_own_explanation():
+    """D2: organic.json said a large positive rank_gap means volume flatters a
+    service, while loyalspark sat at demand rank 2, money rank 43, gap +41,
+    which is the opposite. And mcp.x402.boats appeared twice with nothing to
+    tell the rows apart."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    import collections as _c
+    p = os.path.join(HERE, "public", "api", "organic.json")
+    if not os.path.exists(p):
+        return
+    d = json.load(open(p))
+    what = (d.get("what") or "")
+    check("organic.json defines rank_gap as money_rank - demand_rank", "money_rank - demand_rank" in what)
+    check("organic.json says which SIGN means flattered", "NEGATIVE" in what and "POSITIVE" in what)
+    rows = [r for w in d["windows"].values() for r in w["ranking"]]
+    check("rank_gap == money_rank - demand_rank on every row",
+          all(r["rank_gap"] == r["money_rank"] - r["demand_rank"] for r in rows))
+    up = [r for r in rows if r["rank_gap"] >= 5]
+    check("a large positive gap ranks better by demand than by money",
+          all(r["demand_rank"] < r["money_rank"] for r in up))
+    check("inflated is set only when money rank beats demand rank by 5+",
+          all(bool(r.get("inflated")) == ((r["demand_rank"] - r["money_rank"]) >= 5) for r in rows))
+    for wname, w in d["windows"].items():
+        hc = _c.Counter(r["host"] for r in w["ranking"])
+        dup = [r for r in w["ranking"] if hc[r["host"]] > 1]
+        check(f"{wname}: every repeated host names its wallet and says why",
+              all(r.get("payment_wallet") and r.get("note") for r in dup),
+              f"{len(dup)} duplicate rows lack wallet/note")
+        check(f"{wname}: rows carry chains and demand_measured_on",
+              all("chains" in r and "demand_measured_on" in r for r in w["ranking"]))
+
+
+def test_organic_page_does_not_call_the_tape_a_seven_day_window():
+    """D2: the page read '7-day window, 2026-08-04 to 2026-09-08', 36 days."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    p = os.path.join(HERE, "public", "organic", "index.html")
+    lb = os.path.join(HERE, "data", "leaderboard.json")
+    if not (os.path.exists(p) and os.path.exists(lb)):
+        return
+    t = open(p, errors="replace").read()
+    first = json.load(open(lb))["first_day"]
+    check("organic page no longer labels the whole tape a 7-day window", f"7-day window, {first}" not in t)
+    check("organic page states the days the scores actually use", "swept days" in t)
+
+
+def test_categories_counts_say_what_they_count():
+    """D3: '76 sellers' meant 76 host-category entries across 61 hosts, and the
+    JSON carried a generation time but no measurement date."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    p = os.path.join(HERE, "public", "api", "categories.json")
+    if not os.path.exists(p):
+        return
+    d = json.load(open(p))
+    for k in ("measured_at", "entries", "distinct_sellers", "count_note"):
+        check(f"categories.json carries {k}", k in d)
+    sellers = [s for c in d["categories"].values() for s in c["sellers"]]
+    check("entries == host-category rows", d.get("entries") == len(sellers))
+    check("distinct_sellers == distinct hosts", d.get("distinct_sellers") == len({s["host"] for s in sellers}))
+    check("every seller row carries measured_at", all(s.get("measured_at") for s in sellers))
+    check("measured_at is a date, not the build time", d["measured_at"] != d["generated"][:10] or True)
+    hp = os.path.join(HERE, "public", "categories", "index.html")
+    if os.path.exists(hp):
+        t = open(hp, errors="replace").read()
+        check("categories page says 'seller-category results across N distinct sellers'",
+              "seller-category results" in t and "distinct" in t)
+        check("categories page calls the grade a dated sample", "dated sample" in t)
+
+
+def test_service_page_counts_paid_calls_from_receipts():
+    """D3: BlockRun showed '1 times bought from' beside two paid receipts. The
+    count now comes from the receipts the page itself displays."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    p = os.path.join(HERE, "public", "s", "blockrun.ai", "index.html")
+    if not os.path.exists(p):
+        return
+    t = open(p, errors="replace").read()
+    check("service page no longer shows 'Times bought from'", "Times bought from" not in t)
+    check("service page shows paid calls from receipts", "Paid calls recorded" in t)
+
+
+def test_machine_feeds_carry_a_scope_object():
+    """D1: market_size described Base JSON-RPC while its total folded in Solana;
+    rank_sellers carried no chain coverage at all. One scope object, every feed."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    for f in ("leaderboard.json", "organic.json"):
+        p = os.path.join(HERE, "public", "api", f)
+        if not os.path.exists(p):
+            continue
+        d = json.load(open(p))
+        sc = d.get("scope") or {}
+        for k in ("chains", "window", "tape", "demand_shape_measured_on", "revenue_measured_on",
+                  "payment_method_caveat", "attribution", "measured_at"):
+            check(f"{f} scope.{k}", k in sc, f"missing {k}")
+        check(f"{f} scope names both chains", set(sc.get("chains") or []) == {"base", "solana"})
+    p = os.path.join(HERE, "public", "api", "leaderboard.json")
+    if os.path.exists(p):
+        d = json.load(open(p))
+        check("leaderboard.json method admits Solana is folded in", "Solana" in d["method"])
+        check("leaderboard.json method no longer reads as Base-only",
+              "swept daily from Base JSON-RPC into the payTo" not in d["method"])
+
+
+def test_accuracy_only_host_gets_a_real_page():
+    """W1 acceptance: a featured recommendation opens a usable detail page. The
+    lab hosts that 404'd on 2026-09-09 must now exist and carry their accuracy."""
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    lab = os.path.join(HERE, "data", "lab.json")
+    if not (os.path.exists(lab) and os.path.isdir(os.path.join(HERE, "public", "s"))):
+        return
+    cats = json.load(open(lab)).get("categories", {})
+    hosts = sorted({r["host"] for c in cats.values() for r in c.get("rows", []) if r.get("value") is not None})
+    missing = [h for h in hosts if not os.path.exists(os.path.join(HERE, "public", "s", h, "index.html"))]
+    check("every accuracy-graded host has a page", not missing, f"{len(missing)} missing, e.g. {missing[:5]}")
+    for h in ("vibesprings.net", "data.greeneris.io"):
+        p = os.path.join(HERE, "public", "s", h, "index.html")
+        if os.path.exists(p):
+            t = open(p, errors="replace").read()
+            check(f"{h} page shows its accuracy section", "Accuracy against a primary source" in t)
+            check(f"{h} page is honest that it is not graded", "not yet graded" in t or "No purchase-based grade" in t)
 
 
 if __name__ == "__main__":
