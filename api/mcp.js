@@ -23,8 +23,18 @@ import { createHash } from "crypto";
 // the raw stream, cap its size, and emit our own -32700.
 export const config = { api: { bodyParser: false } };
 
-const SERVER = { name: "whatagentsbuy", version: "1.0.0" };
-const FALLBACK_PROTOCOL = "2025-06-18";
+const SERVER = { name: "whatagentsbuy", version: "1.1.0" };
+// Protocol versions this server actually implements, newest first. initialize
+// used to echo whatever the client named, so a fictitious "2099-01-01" came
+// back as the negotiated version (2026-09-09 evaluation, M4). Per the spec: if
+// the client's version is one we speak, answer with it; otherwise answer with
+// the newest we support and let the client decide whether it can proceed.
+const SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const FALLBACK_PROTOCOL = SUPPORTED_PROTOCOLS[0];
+export function negotiateProtocol(requested) {
+  const r = typeof requested === "string" ? requested.trim() : "";
+  return SUPPORTED_PROTOCOLS.includes(r) ? r : FALLBACK_PROTOCOL;
+}
 
 // JSON-RPC is tiny; even a large legal batch is a few KB. Anything past this is a
 // mistake or an attempt to make us buffer, so we refuse it before allocating.
@@ -61,6 +71,10 @@ const TOOLS = [
         max_price_usdc: { type: "number", description: "Optional ceiling on the per-call price in USDC" },
         min_reliability: { type: "integer", description: "Optional floor on the reliability score 0-100 (default 0 = no floor; the whole reachable market)" },
         limit: { type: "integer", description: "How many results (default 8, max 25)" },
+        allowed_verdicts: {
+          type: "array", items: { type: "string", enum: ["CLEAR", "HOLD", "ABORT", "UNRATED"] },
+          description: "Optional policy filter: only return sellers whose current preflight verdict is in this list, e.g. [\"CLEAR\"]. Default: no filter, every result carries its verdict so you can decide.",
+        },
       },
       required: ["task"],
     },
@@ -70,7 +84,8 @@ const TOOLS = [
     title: "The one check before your agent pays",
     description:
       "USE WHEN your agent is about to pay an x402 API and you want to know if it is safe and worth it. " +
-      "Returns one verdict for a URL or host, gate your payment on it: CLEAR (nothing alarming), HOLD (pay " +
+      "Returns one verdict for a URL or host in the `verdict` field (gate on that; `light` is the same decision " +
+      "as a colour, for display): CLEAR (nothing alarming), HOLD (pay " +
       "but resolve the reasons), ABORT (do not pay without checking the live 402), UNRATED (no data). Also " +
       "returns a confidence tier (verified = a payment to this seller settled AND produced a gradeable result, checked = free probe measured) and its " +
       "payment history. Folds live price and payTo honesty, phantom paywalls, delivery receipts, and the " +
@@ -304,9 +319,58 @@ const TOOL_ALIASES = {
   is_volume_real: "is_organic",       // folded into look_up_seller; alias kept callable
 };
 
+// A caller mistake used to be silently repaired into a valid request:
+// max_price_usdc:"oops" became "no ceiling", by:"bananas" became revenue, url:123
+// became host 0.0.0.123 (2026-09-09 evaluation, M3). Removing a budget
+// constraint by accident is the worst of these. Validate against the schema we
+// publish and say which field is wrong. Keyed by advertised name AND internal
+// name so every alias is covered; tools without a schema are not validated.
+const SCHEMA_BY_TOOL = {};
+for (const t of TOOLS) {
+  SCHEMA_BY_TOOL[t.name] = t.inputSchema;
+  SCHEMA_BY_TOOL[TOOL_ALIASES[t.name] || t.name] = t.inputSchema;
+}
+export class InputError extends Error {
+  constructor(field, why) {
+    super(`invalid argument ${field}: ${why}`);
+    this.field = field;
+    this.input_error = true;
+  }
+}
+const describeVal = (v) => Array.isArray(v) ? "an array" : v === null ? "null"
+  : typeof v === "string" ? `string ${JSON.stringify(v.slice(0, 40))}` : `${typeof v} ${JSON.stringify(v)}`;
+export function validateArgs(name, args) {
+  const schema = SCHEMA_BY_TOOL[TOOL_ALIASES[name] || name];
+  if (!schema) return;
+  if (args !== undefined && args !== null && (typeof args !== "object" || Array.isArray(args)))
+    throw new InputError("arguments", `expected an object, got ${describeVal(args)}`);
+  const a = args || {};
+  for (const req of schema.required || [])
+    if (a[req] === undefined || a[req] === null || a[req] === "") throw new InputError(req, "is required");
+  for (const [k, spec] of Object.entries(schema.properties || {})) {
+    const v = a[k];
+    if (v === undefined || v === null) continue;
+    const bad = (why) => { throw new InputError(k, `${why}, got ${describeVal(v)}`); };
+    const t = spec.type;
+    if (t === "number" && !(typeof v === "number" && Number.isFinite(v))) bad("expected a number");
+    if (t === "integer" && !Number.isInteger(v)) bad("expected an integer");
+    if (t === "string" && typeof v !== "string") bad("expected a string");
+    if (t === "boolean" && typeof v !== "boolean") bad("expected a boolean");
+    if (t === "array" && !Array.isArray(v)) bad("expected an array");
+    if (spec.enum && !spec.enum.includes(v)) bad(`expected one of ${spec.enum.join(", ")}`);
+    if (spec.minimum !== undefined && v < spec.minimum) bad(`must be at least ${spec.minimum}`);
+    if (spec.maximum !== undefined && v > spec.maximum) bad(`must be at most ${spec.maximum}`);
+    if (spec.items?.enum && Array.isArray(v))
+      for (const x of v) if (!spec.items.enum.includes(x)) bad(`every item must be one of ${spec.items.enum.join(", ")}`);
+  }
+}
+
+const PF_LABEL = { green: "CLEAR", yellow: "HOLD", red: "ABORT", gray: "UNRATED" };
+
 export async function runTool(name, args, fetchJson = siteJson) {
   const a = args || {};
   name = TOOL_ALIASES[name] || name;
+  validateArgs(name, a);
 
   // market_size merges the two old market tools into one call: what actually
   // settled (market_summary) plus the live market pulse (market_pulse).
@@ -398,6 +462,9 @@ export async function runTool(name, args, fetchJson = siteJson) {
     }
     return {
       ranked_by: by,
+      scope: board.scope || null,
+      chains_measured: board.chains_measured || null,
+      chain_note: board.chain_note || null,
       as_of: board.as_of,
       window: board.window,
       caveat:
@@ -472,10 +539,26 @@ export async function runTool(name, args, fetchJson = siteJson) {
     const minRel = Number.isInteger(a.min_reliability) ? a.min_reliability : 0;
     const limit = Math.min(Math.max(parseInt(a.limit || 8, 10), 1), 25);
 
-    const [cat, corpus] = await Promise.all([
+    const [cat, corpus, pf] = await Promise.all([
       fetchJson("/api/catalog.json"),
       fetchJson("/api/categories.json"),
+      // The shortlist used to omit the seller's own HOLD, which only surfaced on
+      // the next call (2026-09-09 evaluation, M2). Every result now carries its
+      // verdict. Tolerant fetch: discovery must not fail if the verdict feed does.
+      fetchJson("/api/preflight.json").catch(() => ({ sellers: {} })),
     ]);
+    const pfs = (pf && pf.sellers) || {};
+    const verdictOf = (host) => {
+      const v = pfs[host];
+      if (!v) return { verdict: "UNRATED", light: "gray", confidence: "unproven", score: null };
+      return {
+        verdict: PF_LABEL[v.light] || String(v.light).toUpperCase(), light: v.light,
+        confidence: v.confidence || (v.receipts ? "verified" : v.checked_live ? "checked" : "unproven"),
+        score: v.score ?? null,
+      };
+    };
+    const allowed = Array.isArray(a.allowed_verdicts) && a.allowed_verdicts.length
+      ? new Set(a.allowed_verdicts) : null;
     // host -> its accuracy grade from the corpus. A seller we PAID and found
     // returns the correct number (vs a primary source) is worth far more than one
     // that merely responds, so these jump to the top of any matching search.
@@ -517,25 +600,34 @@ export async function runTool(name, args, fetchJson = siteJson) {
       (y.e.reliability || 0) - (x.e.reliability || 0) ||
       (x.e.price_usdc ?? 9e9) - (y.e.price_usdc ?? 9e9));
 
-    const results = scored.slice(0, limit).map(({ e, acc }) => ({
+    const eligible = allowed ? scored.filter(({ e }) => allowed.has(verdictOf(e.host).verdict)) : scored;
+    const results = eligible.slice(0, limit).map(({ e, acc }) => ({
       host: e.host, url: e.url, description: e.description,
       price_usdc: e.price_usdc, method: e.method, chains: e.chains,
       reliability: e.reliability,
       graded_accurate: acc ? { category: acc.category, off_by: acc.off_by, unit: acc.unit, vs: acc.vs } : null,
       price_honest: e.price_honest, payto_honest: e.payto_honest,
       grades_we_earned_by_paying: e.grades,
+      // The verdict is aggregated at the HOST: a HOLD means something at this
+      // seller underdelivered or looked wrong, not that this exact endpoint did.
+      preflight: { ...verdictOf(e.host), scope: "host", as_of: (pf && pf.generated) || null },
     }));
     return {
       task: a.task,
       searched: (cat.endpoints || []).length,
-      filters: { max_price_usdc: maxPrice === Infinity ? null : maxPrice, min_reliability: minRel },
+      filters: { max_price_usdc: maxPrice === Infinity ? null : maxPrice, min_reliability: minRel,
+                 allowed_verdicts: allowed ? [...allowed] : null },
+      ranked_by: ["graded_accurate (same category as the task only)", "reliability", "price_usdc"],
       count: results.length,
       results,
       how_to_use:
         "Ranked by whether we PAID the seller and found it returns the correct value (graded_accurate, " +
-        "against a primary source), then by reliability (a free payment-safety score), then price. Prefer a " +
-        "graded_accurate seller. Then call preflight(host) on your pick and read the amount and payTo out of " +
-        "the live 402. For a whole category ranked by accuracy, use most_accurate.",
+        "against a primary source), then by reliability (a free payment-safety score), then price; price is " +
+        "the LAST key, so a cheaper seller can rank below a more reliable one. Each result carries " +
+        "preflight.verdict (CLEAR / HOLD / ABORT / UNRATED) with its confidence and age; pass " +
+        "allowed_verdicts to filter by policy. Prefer a graded_accurate seller. Then call " +
+        "check_before_paying(url) on your pick for the reasons, and read the amount and payTo out of the " +
+        "live 402. For a whole category ranked by accuracy, use rank_by_accuracy.",
       as_of: cat.generated,
     };
   }
@@ -591,6 +683,8 @@ export async function runTool(name, args, fetchJson = siteJson) {
     if (!looksLikeHost) {
       return {
         host, light: "gray", verdict: "UNRATED", input_error: true,
+        confidence: "unproven", confidence_basis: "nothing was checked", score: null,
+        evidence: null, payment_history: null,
         gate: `"${host}" is not a hostname, so nothing was checked and this is NOT a clearance. ` +
           "Pass the seller URL you are about to pay, e.g. https://seller.example/api. " +
           "If you are using preflight-x402, wrap the fetch function itself " +
@@ -605,9 +699,13 @@ export async function runTool(name, args, fetchJson = siteJson) {
     if (!v) {
       return {
         host, light: "gray", verdict: "UNRATED",
+        // The unknown-host answer omitted confidence while every doc said each
+        // verdict carries one (2026-09-09 evaluation, M3). Same shape every time.
+        confidence: "unproven", confidence_basis: "no data on this host", score: null,
+        evidence: null, payment_history: null,
         gate: "No data on this host yet. It was silent when we last swept the directory, or is not " +
           "listed. Absence is not a bad sign, but nothing here has been verified: read the live 402.",
-        reasons: [], seller_page: `https://whatagentsbuy.com/s/${host}`,
+        reasons: [], seller_page: null,
         always: ALWAYS, as_of: pf.generated, ...(detail ? { detail_checks: detail } : {}),
       };
     }
@@ -650,7 +748,8 @@ export async function runTool(name, args, fetchJson = siteJson) {
       // payments to this exact seller, not an inspection of its 402 challenge.
       payment_history: v.history || null,
       ...(detail ? { detail_checks: detail } : {}),
-      seller_page: `https://whatagentsbuy.com/s/${host}`,
+      // Only when the page exists: an agent following a 404 is the W1 bug again.
+      seller_page: v.page ? `https://whatagentsbuy.com/s/${host}` : null,
       always: ALWAYS,
       as_of: pf.generated,
     };
@@ -670,6 +769,11 @@ export async function runTool(name, args, fetchJson = siteJson) {
       tape_to: board.tape_to,
       method: board.method,
       caveat: board.caveat,
+      // Scope travels with the number (2026-09-09 evaluation, D1): this total
+      // folds in Solana while demand-shape fields are Base only; say so here.
+      scope: board.scope || null,
+      chains_measured: board.chains_measured || null,
+      chain_note: board.chain_note || null,
     };
   }
 
@@ -705,8 +809,14 @@ export async function runTool(name, args, fetchJson = siteJson) {
         sequencer_fees_24h_usd: b.fees24h ?? null,
         transactions_per_day: b.txDay ?? null,
       },
+      // build.py is explicit that /x402 is Base only over UTC days, while this
+      // caveat claimed every chain (2026-09-09 evaluation, D1). Say the scope
+      // once, as data, and keep the prose consistent with it.
+      scope: { chains: ["base"], token: "USDC", window: "UTC calendar days, current day partial",
+               note: "This pulse is the /x402 dashboard: Base only. settled_last_day (market_summary) folds " +
+                     "Solana into its total; compare the two with that in mind." },
       caveats: [
-        "x402 figures count every chain the protocol settles on, roughly 90% Base.",
+        "These x402 figures are Base only (the /x402 dashboard's scope); other chains are not in this pulse.",
         "The current UTC day is incomplete; compare closed days to closed days.",
         "Payment COUNT is heavily concentrated: one high-volume wallet can be most " +
           "of the transactions while moving a small share of the dollars, so quoting " +
@@ -840,16 +950,17 @@ export default async function handler(req, res) {
         events.push({ surface: "mcp", method: "initialize", status: "ok", ok: true,
                       protocol: params?.protocolVersion || null, ...ctx() });
         out.push(rpc(id, {
-          // Echo the client's version when it names one; guessing a version the
-          // client does not speak is how these handshakes fail.
-          protocolVersion: params?.protocolVersion || FALLBACK_PROTOCOL,
+          // A version we support, never an echo of one we do not.
+          protocolVersion: negotiateProtocol(params?.protocolVersion),
           capabilities: { tools: { listChanged: false } },
           serverInfo: SERVER,
           instructions:
             "Independent measurements of x402 API sellers. Grades come from actually paying each " +
             "service and recording what happened; nothing is sponsored. WHICH TOOL FOR WHICH JOB: " +
-            "need an API for a task -> find_api. About to pay one -> check_before_paying (returns a " +
-            "CLEAR / HOLD / ABORT verdict to gate on; detail:true for the full read). Deep-dive one " +
+            "need an API for a task -> find_api (every result carries its preflight verdict). About to pay " +
+            "one -> check_before_paying (returns CLEAR / HOLD / ABORT / UNRATED in the `verdict` field, which " +
+            "is the field to gate on; `light` is the same decision as a colour, for display; detail:true for " +
+            "the full read). Deep-dive one " +
             "seller -> look_up_seller. Want a leaderboard -> rank_sellers (by revenue or real_demand). " +
             "A category with a right answer (crypto/stock/fx/gas/wallet/weather) -> rank_by_accuracy. " +
             "How big is x402 -> market_size. Avoid known losses -> known_payment_traps. Every verdict " +
@@ -916,6 +1027,9 @@ export default async function handler(req, res) {
         out.push(rpc(id, {
           content: [{ type: "text", text: `Error: ${e.message}` }],
           isError: true,
+          // Field-level, machine-readable, so a client can tell a bad argument
+          // from an outage and fix the caller instead of retrying.
+          ...(e.input_error ? { structuredContent: { input_error: true, field: e.field, message: e.message } } : {}),
         }));
       } else if (!isNotification) {
         out.push(rpcError(id, -32603, e.message));

@@ -9,7 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import handler, { normHost, rank, runTool, clientToken, clientKind } from "./mcp.js";
+import handler, { normHost, rank, runTool, clientToken, clientKind, validateArgs, negotiateProtocol } from "./mcp.js";
 
 test("clientKind counts only real agents as agents (honest measurement)", () => {
   // research/scanner/monitor tools are NOT agents, however they name themselves
@@ -354,4 +354,117 @@ test("preflight names a non-host target instead of shrugging UNRATED", async () 
   // localhost stays usable for local development
   const local = await runTool("preflight", { url: "http://localhost:8080/x" }, mockFetch(fx));
   assert.equal(local.input_error, undefined);
+});
+
+// --- 2026-09-09 external evaluation (M1-M4), each finding verified live first ---
+
+test("M3: a typo in an argument is an error, never a silently repaired request", () => {
+  // max_price_usdc:"oops" used to remove the budget ceiling and return results.
+  assert.throws(() => validateArgs("find_api", { task: "btc", max_price_usdc: "oops" }), /max_price_usdc.*number/);
+  // by:"bananas" used to quietly return the revenue ranking.
+  assert.throws(() => validateArgs("rank_sellers", { by: "bananas" }), /by.*revenue, real_demand/);
+  assert.throws(() => validateArgs("top_services", { by: "bananas" }), /by/);        // old name, same schema
+  // url:123 used to be coerced to host 0.0.0.123 and answered UNRATED.
+  assert.throws(() => validateArgs("check_before_paying", { url: 123 }), /url.*string/);
+  assert.throws(() => validateArgs("preflight", { url: 123 }), /url/);
+  assert.throws(() => validateArgs("find_api", {}), /task.*required/);
+  assert.throws(() => validateArgs("find_api", { task: "x", limit: 2.5 }), /limit.*integer/);
+  assert.throws(() => validateArgs("rank_sellers", { limit: 0 }), /limit.*at least 1/);
+  assert.throws(() => validateArgs("find_api", { task: "x", allowed_verdicts: ["MAYBE"] }), /allowed_verdicts/);
+  assert.doesNotThrow(() => validateArgs("find_api", { task: "btc", max_price_usdc: 0.01, limit: 5, allowed_verdicts: ["CLEAR"] }));
+  assert.doesNotThrow(() => validateArgs("market_summary", { anything: 1 }));   // no schema: not validated
+  assert.doesNotThrow(() => validateArgs("check_before_paying", { url: "blockrun.ai", detail: true }));
+});
+
+test("M3: runTool rejects invalid input before touching any data", async () => {
+  await assert.rejects(runTool("find_api", { task: "btc", max_price_usdc: "oops" }, mockFetch({})), /max_price_usdc/);
+  await assert.rejects(runTool("rank_sellers", { by: "bananas" }, mockFetch({})), /by/);
+  await assert.rejects(runTool("check_before_paying", { url: 123 }, mockFetch({})), /url/);
+});
+
+test("M3: the JSON-RPC error for a bad argument is field-level and machine-readable", async () => {
+  const req = { method: "POST", headers: { "user-agent": "test/1" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call",
+      params: { name: "find_api", arguments: { task: "btc", max_price_usdc: "oops" } } }) };
+  let sent;
+  const res = { setHeader() {}, status() { return this; }, json(x) { sent = x; return this; }, end() { return this; } };
+  await handler(req, res);
+  assert.equal(sent.result.isError, true);
+  assert.equal(sent.result.structuredContent.input_error, true);
+  assert.equal(sent.result.structuredContent.field, "max_price_usdc");
+});
+
+test("M4: initialize negotiates a supported protocol version, never echoes a fictitious one", () => {
+  assert.equal(negotiateProtocol("2099-01-01"), "2025-06-18");
+  assert.equal(negotiateProtocol("2025-03-26"), "2025-03-26");
+  assert.equal(negotiateProtocol("2024-11-05"), "2024-11-05");
+  assert.equal(negotiateProtocol(undefined), "2025-06-18");
+  assert.equal(negotiateProtocol(""), "2025-06-18");
+});
+
+test("M2: find_api carries each result's preflight verdict, and can filter on it", async () => {
+  const fx = { ...EMPTY_CORPUS,
+    "/api/catalog.json": { generated: "x", endpoints: [
+      { host: "hold.example", url: "https://hold.example/btc", description: "btc price", price_usdc: 0.001, reliability: 100 },
+      { host: "clear.example", url: "https://clear.example/btc", description: "btc price", price_usdc: 0.002, reliability: 90 },
+      { host: "new.example", url: "https://new.example/btc", description: "btc price", price_usdc: 0.003, reliability: 50 },
+    ] },
+    "/api/preflight.json": { generated: "2026-09-09", sellers: {
+      "hold.example": { light: "yellow", score: 80, confidence: "verified", receipts: 2, checked_live: true, reasons: [] },
+      "clear.example": { light: "green", score: 95, confidence: "checked", receipts: 0, checked_live: true, reasons: [] },
+    } },
+  };
+  const out = await runTool("find_api", { task: "btc price" }, mockFetch(fx));
+  const by = Object.fromEntries(out.results.map((r) => [r.host, r.preflight]));
+  assert.equal(by["hold.example"].verdict, "HOLD");           // the warning that used to be omitted
+  assert.equal(by["hold.example"].confidence, "verified");
+  assert.equal(by["hold.example"].scope, "host");
+  assert.equal(by["clear.example"].verdict, "CLEAR");
+  assert.equal(by["new.example"].verdict, "UNRATED");
+  assert.equal(by["new.example"].confidence, "unproven");
+  assert.ok(Array.isArray(out.ranked_by) && out.ranked_by[2] === "price_usdc");
+  const only = await runTool("find_api", { task: "btc price", allowed_verdicts: ["CLEAR"] }, mockFetch(fx));
+  assert.deepEqual(only.results.map((r) => r.host), ["clear.example"]);
+  assert.deepEqual(only.filters.allowed_verdicts, ["CLEAR"]);
+});
+
+test("M2: find_api still answers when the preflight feed is unavailable", async () => {
+  const fx = { ...EMPTY_CORPUS, "/api/catalog.json": { generated: "x", endpoints: [
+    { host: "a.example", url: "https://a.example", description: "btc price", price_usdc: 0.001, reliability: 90 } ] } };
+  const out = await runTool("find_api", { task: "btc price" }, mockFetch(fx));
+  assert.equal(out.results[0].preflight.verdict, "UNRATED");
+  assert.equal(out.results[0].preflight.as_of, null);
+});
+
+test("M3: an unknown host's UNRATED carries confidence and the same shape as a rated one", async () => {
+  const fx = { "/api/preflight.json": { generated: "2026-09-09", sellers: {} } };
+  const out = await runTool("check_before_paying", { url: "https://nobody.example/x" }, mockFetch(fx));
+  assert.equal(out.verdict, "UNRATED");
+  assert.equal(out.light, "gray");
+  assert.equal(out.confidence, "unproven");
+  for (const k of ["score", "evidence", "payment_history", "confidence_basis"]) assert.ok(k in out, `missing ${k}`);
+});
+
+test("D1: market_summary and rank_sellers pass the feed's scope through", async () => {
+  const board = { as_of: "2026-09-09", window: "24h", total_usdc: 1, total_settlements: 1, tape_from: "a", tape_to: "b",
+    method: "m", caveat: "c", scope: { chains: ["base", "solana"] }, chains_measured: ["base", "solana"], chain_note: "n", rows: [] };
+  const fx = { "/api/leaderboard.json": board };
+  const ms = await runTool("market_summary", {}, mockFetch(fx));
+  assert.deepEqual(ms.scope, { chains: ["base", "solana"] });
+  const rs = await runTool("rank_sellers", { by: "revenue" }, mockFetch(fx));
+  assert.deepEqual(rs.scope, { chains: ["base", "solana"] });
+  assert.equal(rs.chain_note, "n");
+});
+
+test("W1 on the wire: seller_page is emitted only when that page exists", async () => {
+  const fx = { "/api/preflight.json": { generated: "2026-09-09", sellers: {
+    "paged.example": { light: "green", score: 90, reasons: [], receipts: 1, checked_live: true, page: true },
+    "probe-only.example": { light: "green", score: 70, reasons: [], receipts: 0, checked_live: true, page: false },
+  } } };
+  const a = await runTool("check_before_paying", { url: "paged.example" }, mockFetch(fx));
+  assert.equal(a.seller_page, "https://whatagentsbuy.com/s/paged.example");
+  const b = await runTool("check_before_paying", { url: "probe-only.example" }, mockFetch(fx));
+  assert.equal(b.seller_page, null);
+  const c = await runTool("check_before_paying", { url: "unknown.example" }, mockFetch(fx));
+  assert.equal(c.seller_page, null);
 });
