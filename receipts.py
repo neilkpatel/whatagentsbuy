@@ -456,14 +456,33 @@ def lookup_capture(url_index, url, ts):
     return versions[-1]
 
 
-def load_raw_payload(raw_ref):
-    """Pull the seller's untouched response data from captures/, matched by
-    url+tx (not a fragile line number). Returns the parsed data, or None."""
-    if not raw_ref:
+def _safe_capture_path(name):
+    """captures/<name> only if <name> is a plain raw_*.jsonl file name (no path
+    parts, no symlink) that resolves inside CAPTURES. A receipt is untrusted
+    input to the verifier, so its raw_ref must not be able to point it at an
+    arbitrary file on the machine running the check."""
+    if not isinstance(name, str) or not name:
         return None
-    m = raw_ref.get("match", {})
-    path = os.path.join(CAPTURES, raw_ref.get("capture", ""))
-    if not os.path.exists(path):
+    if "/" in name or "\\" in name or name.startswith(".") or name != os.path.basename(name):
+        return None
+    if not (name.startswith("raw_") and name.endswith(".jsonl")):
+        return None
+    path = os.path.join(CAPTURES, name)
+    if os.path.islink(path) or not os.path.isfile(path):
+        return None
+    root = os.path.realpath(CAPTURES)
+    if not os.path.realpath(path).startswith(root + os.sep):
+        return None
+    return path
+
+
+def _raw_record(raw_ref):
+    """The archived capture line a raw_ref names, or None if it can't be found."""
+    if not isinstance(raw_ref, dict):
+        return None
+    m = raw_ref.get("match") or {}
+    path = _safe_capture_path(raw_ref.get("capture"))
+    if not path:
         return None
     with open(path) as fh:
         for line in fh:
@@ -471,9 +490,9 @@ def load_raw_payload(raw_ref):
                 rec = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(rec, dict):
+                continue
             if m.get("call_id"):
-                # the dispatch-minted id is the strongest identity; nothing else
-                # needs to match when it does
                 if rec.get("call_id") != m["call_id"]:
                     continue
             else:
@@ -481,11 +500,34 @@ def load_raw_payload(raw_ref):
                     continue
                 if _tx_of(rec.get("stdout", "")) != m.get("tx"):
                     continue
-            try:
-                return json.loads(rec["stdout"]).get("data")
-            except (ValueError, KeyError):
-                return None
+            return rec
     return None
+
+
+def raw_digest_matches(raw_ref):
+    """True/False: does raw_ref.sha256 match the archived stdout it points at?
+    None: nothing to check here (no digest recorded, or the capture is not on
+    this machine, as in a public clone). A delivery receipt_id does not commit
+    to this digest (see VERSION note), so the raw level checks it instead."""
+    if not isinstance(raw_ref, dict) or not raw_ref.get("sha256"):
+        return None
+    rec = _raw_record(raw_ref)
+    if rec is None or not isinstance(rec.get("stdout"), str):
+        return None
+    got = hashlib.sha256(rec["stdout"].encode()).hexdigest()[:16]
+    return got == raw_ref["sha256"]
+
+
+def load_raw_payload(raw_ref):
+    """Pull the seller's untouched response data from captures/, matched by
+    url+tx (not a fragile line number). Returns the parsed data, or None."""
+    rec = _raw_record(raw_ref)
+    if rec is None:
+        return None
+    try:
+        return json.loads(rec["stdout"]).get("data")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
 
 
 # ---- verification: the trustless core -----------------------------------------
@@ -589,7 +631,7 @@ def evidence_of(receipt):
                        "raw_sha256": ref.get("sha256"),
                        "v": receipt.get("version")})
         return ev
-    return _evidence(
+    ev = _evidence(
         url=receipt["seller"]["url"], host=receipt["seller"]["host"],
         quoted=receipt["promise"]["price_usdc"],
         charged=receipt["payment"]["charged_usdc"],
@@ -600,14 +642,24 @@ def evidence_of(receipt):
         status=receipt["verdict"]["status"], why=receipt["verdict"]["why"],
         version=receipt.get("version", "1"),
     )
+    if not v1:
+        # Rebuild from the STORED chain label, not the constant _evidence()
+        # inserts, so editing payment.chain changes the recomputed id. Honest
+        # receipts all say "base", so no published id changes. (Reported 11/8/26
+        # by an outside auditor: a chain-only edit passed integrity.)
+        ev["chain"] = receipt["payment"].get("chain")
+    return ev
 
 
 def verify_receipt(receipt):
     """Re-derive the receipt at all three levels. Returns a dict of pass/None
     (None = not checkable here, e.g. no archived raw for this call)."""
     out = {}
-    # 1. integrity: the id is a faithful hash of the evidence
-    out["integrity"] = content_id(evidence_of(receipt)) == receipt["receipt_id"]
+    # 1. integrity: the id is a faithful hash of the evidence, and the receipt
+    #    claims the only chain we settle on. The chain check also covers v1
+    #    records, whose id never hashed the chain at all.
+    out["integrity"] = (content_id(evidence_of(receipt)) == receipt["receipt_id"]
+                        and receipt.get("payment", {}).get("chain") == "base")
     # 2. verdict: re-judge the saved response shape against the promise, offline.
     #    A verdict decided by the two-call reconcile cannot be reproduced from one
     #    stored shape, so it is honestly n/a here (the raw level still checks it).
@@ -634,8 +686,11 @@ def verify_receipt(receipt):
         # numeric leaf equal to the recorded value still counts (a provenance
         # check, not a grading one). CAVEAT: a unit-converted reading (weather
         # C->F) can legitimately fail this literal check; None = not assessable.
-        payload = load_raw_payload(receipt["delivery"].get("raw_ref"))
-        if payload is None or ret is None:
+        raw_ref = receipt["delivery"].get("raw_ref")
+        payload = load_raw_payload(raw_ref)
+        if raw_digest_matches(raw_ref) is False:
+            out["raw"] = False          # the recorded digest is not these bytes
+        elif payload is None or ret is None:
             out["raw"] = None
         else:
             fv = _extract_field(payload, receipt["delivery"].get("field"))
@@ -649,9 +704,14 @@ def verify_receipt(receipt):
         out["verdict"] = regraded["status"] == receipt["verdict"]["status"]
     else:
         out["verdict"] = None
-    # 3. raw: re-derive the shape from the untouched archived bytes
-    payload = load_raw_payload(receipt["delivery"].get("raw_ref"))
-    if payload is None:
+    # 3. raw: re-derive the shape from the untouched archived bytes. A delivery
+    #    id does not commit to raw_ref.sha256, so this level checks the digest
+    #    against the archived bytes; a mismatch fails here.
+    raw_ref = receipt["delivery"].get("raw_ref")
+    payload = load_raw_payload(raw_ref)
+    if raw_digest_matches(raw_ref) is False:
+        out["raw"] = False
+    elif payload is None:
         out["raw"] = None
     else:
         out["raw"] = (conform.describe_shape(payload)

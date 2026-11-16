@@ -10,7 +10,7 @@ one-day number under a seven-day heading. They fill in as the daily job runs.
 
 Writes data/leaderboard.json for the site.
 """
-import glob, json, math, os, time
+import glob, gzip, json, math, os, time
 from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -25,14 +25,21 @@ BURN_ADDRS = {"0x0000000000000000000000000000000000000000",
               "0x000000000000000000000000000000000000dead"}
 
 
-def address_to_service():
-    """Map each payment address to the service that asked us to pay it."""
-    latest = json.load(open(os.path.join(DATA, "latest.json")))
+def _brandiness(r):
+    """Prefer the most brand-like domain among listings that share a wallet."""
+    d = r["origin"].lower()
+    noise = sum(t in d for t in ("vercel.app", "run.app", "onrender.com",
+                                 "railway.app", "workers.dev", "-git-"))
+    return (noise, d.count("-"), len(d))
+
+
+def _owners_from_origins(origins):
+    """{payTo address: the service that advertised it} for one probe snapshot."""
     owners = defaultdict(list)
-    for r in latest["origins"]:
-        # The probe now records payTo as a {address: count} dict, and older runs
-        # used a payto_addresses list. Read both, or every Base address silently
-        # stops resolving to a host and the leaderboard shows bare 0x strings.
+    for r in origins or []:
+        # The probe records payTo as a {address: count} dict; older runs used a
+        # payto_addresses list. Read both, or every Base address silently stops
+        # resolving and the leaderboard shows bare 0x strings.
         addrs = r.get("payto")
         if isinstance(addrs, dict):
             addrs = list(addrs.keys())
@@ -43,19 +50,76 @@ def address_to_service():
                 owners[a.lower()].append(r)
     out = {}
     for addr, rows in owners.items():
-        # prefer the most brand-like domain among listings sharing a wallet
-        def score(r):
-            d = r["origin"].lower()
-            noise = sum(t in d for t in ("vercel.app", "run.app", "onrender.com",
-                                         "railway.app", "workers.dev", "-git-"))
-            return (noise, d.count("-"), len(d))
-        head = sorted(rows, key=score)[0]
-        out[addr] = {
-            "service": head.get("service") or head["origin"],
-            "host": head["origin"],
-            "grade": head.get("grade"),
-            "shares": len(rows),
-        }
+        head = sorted(rows, key=_brandiness)[0]
+        out[addr] = {"service": head.get("service") or head["origin"], "host": head["origin"],
+                     "grade": head.get("grade"), "shares": len(rows)}
+    return out
+
+
+HISTORY_FILE = "payto_history.json"
+
+
+def payto_history(update=None, as_of=None, write=True):
+    """Every payTo we have ever seen a host advertise, newest claim winning.
+
+    Sellers rotate their payment address. Resolving addresses from TODAY's probe
+    alone means money that arrived at the old one stops resolving to anybody:
+    api.surplusintelligence.ai moved wallet on 2026-09-12 and its earlier $20k
+    week rendered as a bare hex string, dropped from the ranking and counted as
+    unattributed. This keeps the old claim so the history stays named.
+
+    Load-merge-write, never overwrite: an address seen once is never forgotten.
+    Backfills from the gzipped probe archive the first time it runs.
+    """
+    path = os.path.join(DATA, HISTORY_FILE)
+    doc = {"generated": None, "addresses": {}}
+    if os.path.exists(path):
+        try:
+            doc = json.load(open(path))
+        except Exception:
+            doc = {"generated": None, "addresses": {}}
+    addrs = doc.setdefault("addresses", {})
+    seeds = []
+    if not addrs:
+        # oldest first, so the newest claim on an address wins
+        for f in sorted(glob.glob(os.path.join(DATA, "probe", "probe_*.json.gz"))):
+            try:
+                with gzip.open(f, "rt") as fh:
+                    snap = json.load(fh)
+                seeds.append((snap.get("date") or os.path.basename(f)[6:16], snap.get("origins")))
+            except Exception:
+                continue
+    if update is not None:
+        seeds.append((as_of or time.strftime("%Y-%m-%d"), update))
+    for day, origins in seeds:
+        for a, meta in _owners_from_origins(origins).items():
+            prev = addrs.get(a)
+            addrs[a] = {"host": meta["host"], "service": meta["service"],
+                        "first_seen": (prev or {}).get("first_seen") or day,
+                        "last_seen": day}
+    if write and seeds:
+        doc["generated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        tmp = path + ".tmp"
+        json.dump(doc, open(tmp, "w"), indent=1)
+        os.replace(tmp, path)
+    return addrs
+
+
+def address_to_service(write_history=True):
+    """Map each payment address to the service that asked us to pay it.
+
+    Today's probe is authoritative. An address no host advertises TODAY falls
+    back to the last host that did (see payto_history), marked `retired` so a
+    caller can tell a live address from one a seller has rotated away from.
+    """
+    latest = json.load(open(os.path.join(DATA, "latest.json")))
+    out = _owners_from_origins(latest.get("origins"))
+    hist = payto_history(update=latest.get("origins"), as_of=latest.get("date"),
+                         write=write_history)
+    for addr, h in hist.items():
+        if addr not in out:
+            out[addr] = {"service": h["service"], "host": h["host"], "grade": None,
+                         "shares": 0, "retired": True, "last_advertised": h.get("last_seen")}
     return out
 
 
@@ -116,13 +180,27 @@ def demand_label(payers, repeat, top1, hhi):
     """
     if not payers:
         return None
-    if top1 is not None and (top1 >= 0.9 or (hhi is not None and hhi >= 0.8)):
+    if top1 is not None and (top1 >= ONE_WALLET_SHARE or (hhi is not None and hhi >= 0.8)):
         return "one wallet"
     if payers <= 5:
         return "thin"
     if payers >= 20 and (top1 is None or top1 <= 0.35) and (hhi is None or hhi <= 0.15):
         return "broad"
     return "mixed"
+
+
+# The Organic Demand Score rubric, in one place. organic_score() applies it and
+# /grading publishes it, so the page can never describe weights the score does not use.
+ODS_PARTS = [
+    ("breadth",    "How many different wallets paid (full marks at 100)", 40),
+    ("dispersion", "How evenly the dollars are spread across those wallets", 40),
+    ("repeat",     "How many buyers came back (full marks at 30%)", 20),
+]
+ODS_W = {k: pts for k, _, pts in ODS_PARTS}
+BREADTH_FULL_AT = 100          # distinct payers for full breadth marks
+REPEAT_FULL_AT = 0.30          # returning share for full repeat marks
+ODS_FLAG_BELOW = 40            # /organic flags a score under this
+ONE_WALLET_SHARE = 0.9         # one wallet this share of the dollars or more
 
 
 def organic_score(payers, repeat, top1, hhi, settlements):
@@ -153,15 +231,15 @@ def organic_score(payers, repeat, top1, hhi, settlements):
     def clamp(x):
         return max(0.0, min(1.0, x))
 
-    breadth = 40.0 * clamp(math.log10(payers) / 2.0)          # 100+ payers tops out
+    breadth = ODS_W["breadth"] * clamp(math.log10(payers) / math.log10(BREADTH_FULL_AT))
 
     conc = hhi
     if conc is None and top1 is not None:
         conc = top1 * top1                                     # crude floor from top1 alone
-    dispersion = 40.0 * clamp((1.0 - conc) / 0.95) if conc is not None else None
+    dispersion = ODS_W["dispersion"] * clamp((1.0 - conc) / 0.95) if conc is not None else None
 
     repeat_rate = (repeat / payers) if payers else 0.0
-    repeats = 20.0 * clamp(repeat_rate / 0.30)                 # 30% returning tops out
+    repeats = ODS_W["repeat"] * clamp(repeat_rate / REPEAT_FULL_AT)
 
     parts = {"breadth": round(breadth, 1),
              "dispersion": round(dispersion, 1) if dispersion is not None else None,
@@ -237,6 +315,9 @@ def main():
                 "service": meta.get("service") or addr[:10] + "…",
                 "host": meta.get("host", ""),
                 "grade": meta.get("grade"),
+                # True when no host advertises this address TODAY and the name
+                # comes from the last host that did (a rotated payTo).
+                "payto_retired": bool(meta.get("retired")) or None,
                 "shared_wallet": meta.get("shares", 1) > 1,
                 "usdc": round(v["usdc"], 4),
                 "usdc_out": round(v["usdc_out"], 4),

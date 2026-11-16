@@ -416,6 +416,30 @@ def probe_origin(origin, items, seed_demand=None):
     return res
 
 
+# The free-probe rubric, in one place. score() applies these and /grading
+# publishes them, so the page can never describe weights the probe does not use.
+RUBRIC = [
+    ("reachable", "The listed pages respond at all", 15),
+    ("handshake", "They answer with a proper payment request (HTTP 402)", 15),
+    ("payable",   "That request has everything an agent needs to pay", 25),
+    ("price",     "The live price matches the listed price, within 2%", 15),
+    ("payto",     "It pays to the address on file, or rotates addresses by design", 10),
+    ("docs",      "It publishes discovery docs (6) and an input schema (4)", 10),
+    ("speed",     "Median response under 0.4s gets 10, under 1s 7, under 2.5s 4, else 1", 10),
+]
+W = {k: pts for k, _, pts in RUBRIC}
+DOCS_POINTS, SCHEMA_POINTS = 6, 4
+SPEED_TIERS = [(400, 10), (1000, 7), (2500, 4)]   # (median ms under, points); slower gets 1
+PRICE_TOLERANCE = 0.02
+PHANTOM_PENALTY = 30
+FREE_TIER_BONUS = 3
+GRADE_CUTS = [("A", 85), ("B", 70), ("C", 55), ("D", 40)]   # below the last cut: F
+
+
+def letter(s):
+    return next((g for g, cut in GRADE_CUTS if s >= cut), "F")
+
+
 def score(o):
     """Weighted quality score. Every component is evidence we measured.
 
@@ -427,28 +451,28 @@ def score(o):
     reached = [c for c in checked if c["status"] is not None]
     s, notes, flags = 0.0, [], []
 
-    # 1. Reachable (15)
+    # 1. Reachable
     if checked:
         rate = len(reached) / len(checked)
-        s += 15 * rate
+        s += W["reachable"] * rate
         if rate < 1:
             flags.append(f"{len(checked)-len(reached)}/{len(checked)} listed resources unreachable")
     else:
         flags.append("no probeable resources")
 
-    # 2. Correct 402 handshake (15)
+    # 2. Correct 402 handshake
     if checked:
         good = len(paid) + len([c for c in checked if c["status"] == 200])
-        s += 15 * (good / len(checked))
+        s += W["handshake"] * (good / len(checked))
         odd = [c for c in checked if c["status"] not in (402, 200, None)]
         if odd:
             codes = sorted({c["status"] for c in odd})
             flags.append(f"{len(odd)} listed resource(s) answer {codes[0]} instead of asking for payment")
 
-    # 3. Payable challenge (25) — can an agent act on the 402 alone?
+    # 3. Payable challenge: can an agent act on the 402 alone?
     if paid:
         payable = [c for c in paid if c["payable"]]
-        s += 25 * (len(payable) / len(paid))
+        s += W["payable"] * (len(payable) / len(paid))
         if not payable:
             samp = next((c["body_sample"] for c in paid if c["body_sample"]), "") or ""
             why = "empty body" if samp.strip() in ("{}", "") else "no payment requirements in the response"
@@ -458,56 +482,56 @@ def score(o):
         else:
             notes.append("challenges carry a complete, machine-payable quote")
 
-    # 4. Price honesty (15) — live quote vs advertised
+    # 4. Price honesty: live quote vs advertised
     comps = [c for c in paid if c["adv_amount"] is not None and c["live_amount"] is not None]
     if comps:
         oks = 0
         for c in comps:
             hi, lo = max(c["adv_amount"], c["live_amount"]), min(c["adv_amount"], c["live_amount"])
-            if hi == 0 or (hi - lo) / hi <= 0.02:
+            if hi == 0 or (hi - lo) / hi <= PRICE_TOLERANCE:
                 oks += 1
-        s += 15 * (oks / len(comps))
+        s += W["price"] * (oks / len(comps))
         if oks < len(comps):
             worst = max(comps, key=lambda c: abs((c["live_amount"] or 0) - (c["adv_amount"] or 0)))
             flags.append(f"price mismatch: registry says ${worst['adv_amount']}, endpoint demands ${worst['live_amount']}")
         else:
             notes.append("live quotes match the public registry")
 
-    # 5. Payment address (10) — matches the registry, or rotates by design
+    # 5. Payment address: matches the registry, or rotates by design
     pcomp = [c for c in paid if c["adv_payto"] and c["live_payto"]]
     if o.get("rotates_payto"):
-        s += 10
+        s += W["payto"]
         notes.append("issues a fresh receiving address per request")
     elif pcomp:
         match = sum(1 for c in pcomp if c["adv_payto"].lower() == c["live_payto"].lower())
-        s += 10 * (match / len(pcomp))
+        s += W["payto"] * (match / len(pcomp))
         if match < len(pcomp):
             flags.append("pays to an address that is not the one on file in the registry")
 
-    # 6. Machine-readable (10): discovery docs + input schema in challenge
+    # 6. Machine-readable: discovery docs + input schema in challenge
     if o["discoverable"]:
-        s += 6
+        s += DOCS_POINTS
         notes.append("publishes " + " and ".join(o["discovery_paths"]))
     if any(c["schema"] for c in paid):
-        s += 4
+        s += SCHEMA_POINTS
         notes.append("challenge carries an input schema")
 
-    # 7. Speed (10)
+    # 7. Speed
     lat = sorted(o["latencies"])
     med = lat[len(lat) // 2] if lat else None
     if med is not None:
-        s += 10 if med < 400 else 7 if med < 1000 else 4 if med < 2500 else 1
+        s += next((pts for ms, pts in SPEED_TIERS if med < ms), 1)
 
     # Penalties
     if o["phantom"]:
-        s -= 30
+        s -= PHANTOM_PENALTY
         flags.append("demands payment for paths that do not exist")
     if o["free_tier"]:
-        s += 3
+        s += FREE_TIER_BONUS
         notes.append("has free endpoints to try first")
 
     s = max(0.0, min(100.0, s))
-    grade = "A" if s >= 85 else "B" if s >= 70 else "C" if s >= 55 else "D" if s >= 40 else "F"
+    grade = letter(s)
     return round(s, 1), grade, notes, flags, med
 
 

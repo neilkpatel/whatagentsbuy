@@ -44,12 +44,25 @@ const MAX_BATCH = 50;
 // Read and size-cap the raw request body. Honours an already-parsed req.body if a
 // runtime provides one, so this stays correct even if the parser is re-enabled.
 async function readRawBody(req, maxBytes = MAX_BODY_BYTES) {
-  if (req.body !== undefined && req.body !== null) return req.body;
+  const tooLarge = () => { const e = new Error("request body too large"); e.code = "TOO_LARGE"; return e; };
+  // Cap what the platform already read, not just what we stream ourselves.
+  // `export const config = { api: { bodyParser: false } }` is a Next.js setting;
+  // on Vercel's plain Node runtime the body still arrives pre-parsed, so the
+  // stream cap below never ran in production and a 2MB body sailed through
+  // (measured against the live server 2026-09-17). Check the declared length
+  // first, then the parsed body, then the stream.
+  const declared = Number((req.headers && req.headers["content-length"]) || 0);
+  if (declared > maxBytes) throw tooLarge();
+  if (req.body !== undefined && req.body !== null) {
+    const s = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
+    if (s && Buffer.byteLength(s) > maxBytes) throw tooLarge();
+    return req.body;
+  }
   const chunks = [];
   let n = 0;
   for await (const chunk of req) {
     n += chunk.length;
-    if (n > maxBytes) { const e = new Error("request body too large"); e.code = "TOO_LARGE"; throw e; }
+    if (n > maxBytes) throw tooLarge();
     chunks.push(chunk);
   }
   return Buffer.concat(chunks).toString("utf8");
@@ -613,7 +626,9 @@ export async function runTool(name, args, fetchJson = siteJson) {
       preflight: { ...verdictOf(e.host), scope: "host", as_of: (pf && pf.generated) || null },
     }));
     return {
-      task: a.task,
+      // Echoed back so a caller can tell which query a result belongs to, capped
+      // so the response can never mirror a huge argument back at the network.
+      task: typeof a.task === "string" && a.task.length > 500 ? a.task.slice(0, 500) + "..." : a.task,
       searched: (cat.endpoints || []).length,
       filters: { max_price_usdc: maxPrice === Infinity ? null : maxPrice, min_reliability: minRel,
                  allowed_verdicts: allowed ? [...allowed] : null },
@@ -868,7 +883,11 @@ function ipHashOf(req) {
   return ip ? createHash("sha256").update(ip + "|wab-evt-v1").digest("hex").slice(0, 16) : null;
 }
 
-async function logEvents(events) {
+export async function logEvents(events) {
+  // Kill switch read at CALL time, not import time: the test suite drives the
+  // real handler, and ESM hoists imports, so a test setting WAB_EVENTS_URL after
+  // its imports would come too late to blank the consts above.
+  if (process.env.WAB_EVENTS_OFF === "1") return;
   if (!EVENTS_URL || !EVENTS_KEY || !events.length) return;
   await fetch(EVENTS_URL, {
     method: "POST",
@@ -969,7 +988,8 @@ export default async function handler(req, res) {
             "unproven = listed, not checked. A CLEAR you can lean on is a verified one, so gate on " +
             "confidence too, not just the light, for payments that matter. The one rule " +
             "that overrides everything: read the payTo and amount from the live 402 and sign against " +
-            "those, never a listing. Older tool names (preflight, get_service, top_services, " +
+            "those, never a listing. How every grade and verdict here is produced, with the weights, " +
+            "sources and tolerances: https://whatagentsbuy.com/grading. Older tool names (preflight, get_service, top_services, " +
             "most_accurate, is_organic, list_traps, market_summary, market_pulse) still work.",
         }));
       } else if (method === "notifications/initialized" || method === "notifications/cancelled") {

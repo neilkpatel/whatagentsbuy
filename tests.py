@@ -119,6 +119,67 @@ def test_address_resolution():
     check("still reads legacy payto_addresses", "0xold" in a2s)
 
 
+# --- a rotated payTo keeps its name -------------------------------------------
+# api.surplusintelligence.ai moved wallet on 2026-09-12. Resolving addresses from
+# today's probe alone, its earlier $60k rendered as a bare hex string: dropped
+# from the ranking and counted as unattributed money. History keeps the old claim.
+def test_rotated_payto_still_resolves():
+    def snap(addr, date):
+        return {"date": date, "origins": [
+            {"origin": "seller.example", "service": "Seller", "grade": "A", "payto": {addr: 4}}]}
+    with tempfile.TemporaryDirectory() as d:
+        _orig = leaderboard.DATA
+        leaderboard.DATA = d
+        try:
+            json.dump(snap("0xOLD", "2026-09-01"), open(os.path.join(d, "latest.json"), "w"))
+            first = leaderboard.address_to_service()
+            check("a live address resolves and is not marked retired",
+                  first["0xold"]["host"] == "seller.example" and not first["0xold"].get("retired"))
+            # the seller rotates: today's probe advertises only the new address
+            json.dump(snap("0xNEW", "2026-09-12"), open(os.path.join(d, "latest.json"), "w"))
+            second = leaderboard.address_to_service()
+            check("the rotated-away address still names the seller",
+                  second["0xold"]["host"] == "seller.example")
+            check("and is marked retired, with the date it was last advertised",
+                  second["0xold"].get("retired") and second["0xold"].get("last_advertised") == "2026-09-01")
+            check("the new address resolves as live",
+                  second["0xnew"]["host"] == "seller.example" and not second["0xnew"].get("retired"))
+            # a later host claiming the same address wins, and nothing is forgotten
+            json.dump({"date": "2026-09-13", "origins": [
+                {"origin": "other.example", "service": "Other", "payto": {"0xOLD": 1}}]},
+                open(os.path.join(d, "latest.json"), "w"))
+            third = leaderboard.address_to_service()
+            check("the newest claim on a reused address wins",
+                  third["0xold"]["host"] == "other.example")
+            check("history never forgets an address it has seen",
+                  "0xnew" in third and third["0xnew"]["host"] == "seller.example")
+        finally:
+            leaderboard.DATA = _orig
+
+
+def test_burn_address_never_enters_payto_history():
+    """The $138M bug, one layer deeper: a burn address must not be remembered
+    either, or it would resolve to a seller forever after."""
+    with tempfile.TemporaryDirectory() as d:
+        _orig = leaderboard.DATA
+        leaderboard.DATA = d
+        try:
+            json.dump({"date": "2026-09-01", "origins": [
+                {"origin": "library.proofivy.com", "service": "Proofivy",
+                 "payto": {"0x0000000000000000000000000000000000000000": 2,
+                           "0x859af250DF0b68bfD0768cA22142a1AFa0aBEAF4": 1}}]},
+                open(os.path.join(d, "latest.json"), "w"))
+            a2s = leaderboard.address_to_service()
+            hist = json.load(open(os.path.join(d, leaderboard.HISTORY_FILE)))["addresses"]
+        finally:
+            leaderboard.DATA = _orig
+    check("the zero address is not remembered in payTo history",
+          "0x0000000000000000000000000000000000000000" not in hist)
+    check("the real address is", "0x859af250df0b68bfd0768ca22142a1afa0abeaf4" in hist)
+    check("and the zero address still maps to no host",
+          "0x0000000000000000000000000000000000000000" not in a2s)
+
+
 # --- burn addresses are never a seller's settlement ("$138M day" bug) ----------
 # library.proofivy.com returned 0x0 as a payTo in one 402, so every USDC burn on
 # chain mapped to it and the headline read $138M. The zero/dead address must
@@ -322,6 +383,52 @@ def test_reconcile_charged_uses_chain():
     check("corrected counts both directions", corrected == 2)
 
 
+def test_reconcile_fixes_paid_and_free_from_chain():
+    # 2026-09-17: the client returned a tx hash with payment.success=false, so
+    # agentsapi.top was recorded paid=False, free=True ("served free") while the
+    # chain showed $0.01 leaving the wallet. The chain decides paid/free too, and
+    # a row reconciled before this fix is re-checked when its flags contradict.
+    import reconcile_charged as rc
+    chain = {"0xpaid": 0.01, "0xnone": 0.0, "0xold": 0.01, "0xfine": 0.01}
+    rows = [{"url": "a", "quoted": 0.01, "charged": 0.01, "tx": "0xpaid",
+             "paid": False, "free": True, "status": "delivered"},
+            {"url": "b", "quoted": 0.01, "charged": 0.01, "tx": "0xnone",
+             "paid": True, "free": False, "status": "delivered"},
+            {"url": "c", "quoted": 0.01, "charged": 0.01, "tx": "0xold",
+             "paid": False, "free": True, "status": "delivered", "charged_reconciled": True},
+            {"url": "d", "quoted": 0.01, "charged": 0.01, "tx": "0xfine",
+             "paid": True, "free": False, "status": "delivered", "charged_reconciled": True}]
+    seen = []
+    def lookup(tx):
+        seen.append(tx)
+        return chain.get(tx)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "c.json")
+        json.dump({"rows": rows}, open(p, "w"))
+        rc.reconcile(p, lookup=lookup)
+        out = json.load(open(p))["rows"]
+    check("a settled tx makes the row paid, never 'served free'",
+          out[0]["paid"] is True and out[0]["free"] is False
+          and out[0]["free_reported"] is True and out[0]["paid_reported"] is False)
+    check("a tx that moved nothing from our wallet is not paid",
+          out[1]["paid"] is False and out[1]["free"] is True)
+    check("a row reconciled before the fix is re-checked when its flags contradict",
+          out[2]["paid"] is True and out[2]["free"] is False and "0xold" in seen)
+    check("an already-consistent reconciled row costs no lookup", "0xfine" not in seen)
+    check("fixed rows are marked so later runs skip them",
+          all(r.get("payment_reconciled") for r in out[:3]))
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "conformance_verified.json")
+        json.dump({"rows": rows}, open(p, "w"))
+        try:
+            rc.reconcile(p, lookup=lookup)
+            refused = False
+        except ValueError:
+            refused = True
+        untouched = json.load(open(p)) == {"rows": rows}
+    check("the verified set is refused, never bulk re-reconciled", refused and untouched)
+
+
 def test_receipt_v2_binds_payment_identity():
     """C3: a v1 accuracy receipt's tx, chain and free flag sat OUTSIDE the hash,
     so they could be altered without breaking the id. v2 binds them, plus the
@@ -349,6 +456,57 @@ def test_receipt_v2_binds_payment_identity():
         mutate(bad)
         check(f"mutating the {label} breaks integrity (was invisible in v1)",
               not receipts.verify_receipt(bad)["integrity"])
+
+
+def test_delivery_receipt_binds_chain_and_checks_raw_digest():
+    """11/8/26 outside audit: on a v2 DELIVERY receipt, editing only payment.chain
+    or only delivery.raw_ref.sha256 still passed integrity under the original id,
+    because _evidence() hashes a constant 'base' and omits the digest. Now the
+    stored chain is hashed (honest ids unchanged) and the raw level checks the
+    digest against the archived bytes."""
+    import receipts, copy, tempfile
+    r = receipts.receipt_from_conformance(_DELIVERED_ROW)
+    check("an honest delivery receipt still verifies", receipts.verify_receipt(r)["integrity"])
+    bad = copy.deepcopy(r)
+    bad["payment"]["chain"] = "solana"
+    check("a chain-only edit on a delivery receipt now breaks integrity",
+          receipts.verify_receipt(bad)["integrity"] is False)
+    v1 = copy.deepcopy(r)
+    v1["version"] = "1"
+    v1["receipt_id"] = receipts.content_id(receipts.evidence_of(v1))
+    v1["payment"]["chain"] = "solana"
+    check("a v1 record claiming a non-Base chain fails too (v1 never hashed chain)",
+          receipts.verify_receipt(v1)["integrity"] is False)
+
+    stdout = json.dumps({"data": {"content_type": "audio/mpeg", "description": "x"},
+                         "metadata": {"payment": {"transactionHash": "0xabc"}}})
+    old = receipts.CAPTURES
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            receipts.CAPTURES = d
+            with open(os.path.join(d, "raw_2026-11-16.jsonl"), "w") as fh:
+                fh.write(json.dumps({"url": _DELIVERED_ROW["url"], "stdout": stdout}) + "\n")
+            ref = {"capture": "raw_2026-11-16.jsonl", "line": 0,
+                   "match": {"url": _DELIVERED_ROW["url"], "tx": "0xabc", "call_id": None},
+                   "sha256": __import__("hashlib").sha256(stdout.encode()).hexdigest()[:16]}
+            good = copy.deepcopy(r)
+            good["delivery"]["raw_ref"] = ref
+            check("the true digest passes the raw level", receipts.verify_receipt(good)["raw"] is True)
+            forged = copy.deepcopy(good)
+            forged["delivery"]["raw_ref"]["sha256"] = "0" * 16
+            v = receipts.verify_receipt(forged)
+            check("a forged raw digest fails the raw level", v["raw"] is False)
+            check("...without changing the published id (no migration)", v["integrity"] is True)
+            for evil in ("../../etc/passwd", "/etc/hosts", "sub/raw_x.jsonl", ".raw_x.jsonl"):
+                esc = copy.deepcopy(good)
+                esc["delivery"]["raw_ref"]["capture"] = evil
+                check(f"raw_ref.capture {evil!r} cannot read outside captures/",
+                      receipts.load_raw_payload(esc["delivery"]["raw_ref"]) is None)
+            os.symlink("/etc/hosts", os.path.join(d, "raw_link.jsonl"))
+            check("a symlinked capture is refused",
+                  receipts._safe_capture_path("raw_link.jsonl") is None)
+        finally:
+            receipts.CAPTURES = old
 
 
 def test_accuracy_verdict_is_recomputed_not_trusted():
@@ -1290,8 +1448,8 @@ def test_every_nav_page_is_in_the_sitemap():
     of 72, and whose whole reason for that URL was ranking for "x402 volume"."""
     import re as _re
     smp = os.path.join(HERE, "public", "sitemap.xml")
-    if not os.path.exists(smp):
-        return                      # nothing built yet
+    if not os.path.exists(smp) or not _built_after_code():
+        return                      # nothing built yet, or built before a nav change
     sm = open(smp).read()
     src = open(os.path.join(HERE, "build.py")).read()
     i = src.index("NAV_ITEMS = [")
@@ -1597,6 +1755,27 @@ def _built_after_code():
     stamp = os.path.join(HERE, "public", "api", "leaderboard.json")
     code = os.path.join(HERE, "build.py")
     return os.path.exists(stamp) and os.path.getmtime(stamp) >= os.path.getmtime(code)
+
+
+def test_rubric_weights_are_whole_and_published():
+    """/grading publishes the weights the graders apply. Both rubrics must add up
+    to 100, and the built page must show every line of both, straight from the
+    constants, so the page cannot drift from the scoring code."""
+    import probe, leaderboard
+    check("probe rubric sums to 100", sum(p for _, _, p in probe.RUBRIC) == 100)
+    check("probe docs points split matches its rubric line",
+          probe.DOCS_POINTS + probe.SCHEMA_POINTS == probe.W["docs"])
+    check("probe letter cuts", [probe.letter(x) for x in (85, 84.9, 70, 55, 40, 39.9)] == list("ABBCDF"))
+    check("demand score parts sum to 100", sum(p for _, _, p in leaderboard.ODS_PARTS) == 100)
+    if not _built_after_code():
+        return   # public/ predates build.py; runs for real after the next build
+    page = open(os.path.join(HERE, "public", "grading", "index.html")).read()
+    import html as _h
+    missing = [label for _, label, _ in probe.RUBRIC + leaderboard.ODS_PARTS
+               if _h.escape(label) not in page]
+    check("/grading shows every rubric line", not missing, str(missing))
+    check("/grading shows every letter cut",
+          all(f"{g} is {c}+" in page for g, c in probe.GRADE_CUTS))
 
 
 def test_every_linked_service_page_exists():

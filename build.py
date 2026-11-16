@@ -9,6 +9,7 @@ import json, os, html, re, email.utils, time, datetime, collections, glob, subpr
 RSS_ITEMS = 50
 from urllib.parse import urlparse
 import preflight
+import leaderboard as _lbm
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -509,7 +510,8 @@ _thesis = ('<b>I pay for these APIs with my own wallet and publish what happened
            'the <a href="/organic">payments off the chain</a> myself. I check whether the answer '
            'that comes back is <a href="/categories">actually right</a>, against a source that '
            'cannot be the seller. And the <a href="/preflight">verdict an agent gates on</a> is '
-           'backed by money that moved. ')
+           'backed by money that moved. Every weight and threshold behind that is published at '
+           '<a href="/grading">how we grade</a>. ')
 # The tail used to re-state the opening ("plus the APIs I buy and grade myself"
 # after "I pay for these APIs with my own wallet"). It now adds the one fact the
 # thesis does not carry: the scope of the sweep.
@@ -1073,7 +1075,7 @@ def _fails_organic(r):
     trust it. Concentration is the honest wash-suspicion signal, already caveated
     site-wide as a flag and not an accusation."""
     ods = r.get("organic_score")
-    return (ods is not None and ods < 40) or (r.get("demand") == "one wallet")
+    return (ods is not None and ods < _lbm.ODS_FLAG_BELOW) or (r.get("demand") == "one wallet")
 
 
 def _organic_view(w):
@@ -1165,7 +1167,8 @@ if LB:
         'rather than its size, and puts the money rank next to it so the reshuffle is visible.</p>'
         f'<p class="hero-stat"><b>{_wash_pct:.0f}%</b> of the last 7 days of Base-measured x402 volume '
         f'(${_wash_usdc:,.0f} of ${_ototal:,.0f}) comes from services that score below 40 on organic '
-        f'demand, or where a single wallet supplied 90% or more of the dollars.</p>'
+        f'demand, or where a single wallet supplied 90% or more of the dollars. '
+        f'<a href="/grading">How the score is built</a>.</p>'
         + (f'<div class="callout"><p><b>Biggest by money, thinnest by demand</b></p><ul class="tight">{_infl_html}</ul></div>' if _infl_html else '')
         + _otable
         + '<p class="note dim"><b>Organic Demand Score</b> (0 to 100) is built from three things and nothing '
@@ -1838,6 +1841,7 @@ NAV_ITEMS = [
     ("/notes", "Field notes"),
     ("/guide", "How to pay"),
     ("/checklist", "Checklist"),
+    ("/grading", "How we grade"),
     ("/api", "API"),
     ("/about", "About"),
 ]
@@ -1858,6 +1862,7 @@ NAV_GROUPS = [
     ("Developers", None, [("/api", "API"), ("/new-endpoints", "New endpoints"),
                           ("/guide", "How to pay"), ("/checklist", "Checklist"),
                           ("/glossary", "Glossary")]),
+    ("How we grade", "/grading", None),
     ("About", "/about", None),
 ]
 
@@ -1882,7 +1887,7 @@ def nav_html(active):
 MASTHEAD = f'''<header class="masthead">
 <h1><a href="/">What Agents Buy<span class="dot">.</span></a></h1>
 <p class="tagline">Independent reviews of the <b>x402</b> APIs behind <b>agentic commerce</b>. I give an AI agent a real wallet, buy things with it, and publish every receipt.</p>
-<p class="mh-by">Written by <a href="{CONTACT}">{BYLINE_NAME}</a><span class="sep">·</span>nothing here is sponsored<span class="sep">·</span>new? <a href="/checklist">start here</a></p>
+<p class="mh-by">Written by <a href="{CONTACT}">{BYLINE_NAME}</a><span class="sep">·</span>nothing here is sponsored<span class="sep">·</span>new? <a href="/checklist">start here</a><span class="sep">·</span><a href="/grading">how we grade</a></p>
 </header>'''
 
 SEARCHBAR = ('<div class="searchbar">'
@@ -2306,7 +2311,8 @@ def _gt(term, body):
 
 GLOSSARY_BODY = (
     '<p class="note">Every term on this site, defined once. If a grade, a score, or a verdict is unclear '
-    'anywhere else, it is explained here. Machine-readable definitions travel in the '
+    'anywhere else, it is explained here. How each one is actually scored is on '
+    '<a href="/grading">how we grade</a>. Machine-readable definitions travel in the '
     '<a href="/api">MCP tool descriptions</a> too.</p>'
     '<h2 class="rsec">Grades, earned by paying</h2><dl class="glist">'
     + _gt("Grade (A+ to F)", "A letter grade for ONE measured behaviour of a seller, earned by actually paying "
@@ -2626,7 +2632,7 @@ ABOUT = f'''<article class="guide">
 (<a href="{AUTHOR_URL}">neilkpatel.com</a>, <a href="{CONTACT}">LinkedIn</a>). I give an AI agent a real wallet,
 let it buy from the APIs other agents are paying for, and publish the receipt: what was quoted, what was actually
 charged, and whether the goods arrived. Feedback, corrections and disputes are welcome on
-<a href="{CONTACT}">LinkedIn</a>.</p>
+<a href="{CONTACT}">LinkedIn</a>. The rubric behind every grade is at <a href="/grading">how we grade</a>.</p>
 
 <h3>The method</h3>
 <ol class="gsteps">
@@ -2973,7 +2979,8 @@ if _dall:
         'input and compares the response against its own advertised output. It is the one thing free '
         'probing cannot see: anyone can read a 402, almost no one pays and checks whether the goods '
         f'arrive. A short means the response was real and genuinely missing fields, confirmed on two '
-        f'separate calls before it is recorded here.</p>'
+        f'separate calls before it is recorded here. The full rubric, including what counts as short, is on '
+        f'<a href="/grading">how we grade</a>.</p>'
         f'<p class="note dim">A further <b>{_DELIVERY_INCONCLUSIVE}</b> endpoints could not be measured: '
         'they need an API key, rejected our advertised input, or returned a 4xx/5xx. Those are counted '
         'as inconclusive, never as a failure to deliver, because not getting a clean response is our '
@@ -3417,7 +3424,8 @@ _glbody = (
     '<span class="glpill gl-green">CLEAR</span> nothing alarming, '
     '<span class="glpill gl-yellow">HOLD</span> pay but verify, '
     '<span class="glpill gl-red">ABORT</span> do not pay without checking, '
-    '<span class="glpill gl-gray">UNRATED</span> no data yet.</p>'
+    '<span class="glpill gl-gray">UNRATED</span> no data yet. '
+    '<a href="/grading">How each verdict is decided</a>.</p>'
     f'<p class="note dim"><b>{_gl_counts.get("green", 0)}</b> clear &middot; <b>{_gl_counts.get("yellow", 0)}</b> '
     f'hold &middot; <b>{_gl_counts.get("red", 0)}</b> abort &middot; <b>{_gl_counts.get("gray", 0)}</b> '
     f'unrated, across {len(_GREENLIGHT)} x402 sellers. '
@@ -3460,6 +3468,129 @@ write("preflight/index.html", site_page(
     "receipts into one gradable signal.",
     _glbody))
 urls.append("/preflight")
+
+# --- /grading : the rubric, published --------------------------------------------
+# Every weight, cut and tolerance on this page is read from the code that applies it
+# (probe.RUBRIC, leaderboard.ODS_PARTS, lab.CONFIG), and every count from the data
+# this build just used, so the page cannot describe a rubric the site does not run.
+import probe as _probe
+import lab as _lab
+
+_gr_origins = D["origins"]
+_gr_graded = [o for o in _gr_origins if o.get("grade") in ("A", "B", "C", "D", "F")]
+_gr_dist = _Counter(o["grade"] for o in _gr_graded)
+_gr_ungraded = len(_gr_origins) - len(_gr_graded)
+_gr_conf = _Counter(v.get("confidence") for v in _GREENLIGHT.values())
+_gr_short = len(_dall) - _d_ok
+assert any(p.get("id") == "answerpool-revenue-stale-tag" for p in FEED), \
+    "/grading links the AnswerPool post, which no longer exists"
+
+
+def _gr_row(*cells):
+    return "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+
+
+def _gr_table(head, rows):
+    return ('<div class="scroll"><table class="tbl"><thead><tr>'
+            + "".join(f"<th>{html.escape(h)}</th>" for h in head)
+            + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
+
+
+def _gr_tol(cfg):
+    if cfg["kind"] == "pct":
+        return f'{cfg["tol"] / 100:g}%'
+    return f'{cfg["tol"]:g} {cfg["unit"]}'
+
+
+_gr_cuts = ", ".join(f"{g} is {c}+" for g, c in _probe.GRADE_CUTS) + ", anything lower is F"
+_gr_dist_txt = ", ".join(f"{_gr_dist.get(g, 0):,} {g}" for g in ("A", "B", "C", "D", "F"))
+
+GRADING_BODY = (
+    '<article class="guide">'
+    '<h2>How we grade</h2>'
+    '<p class="glede">Every seller gets graded on four questions. Two are checked for free on every seller, '
+    'every day. The other two only get graded after I have paid.</p>'
+    + _gr_table(["Question", "Cost", "Who gets checked", "Where to see it"], [
+        _gr_row("1. Does the paywall work?", "Free", f"Every listed seller, daily ({len(_gr_origins):,})",
+                '<a href="/preflight">Preflight</a>'),
+        _gr_row("2. Did it deliver?", "Paid", "Sellers I have bought from", '<a href="/delivery">Delivery checks</a>'),
+        _gr_row("3. Was the answer right?", "Paid", "Categories with one right answer", '<a href="/categories">Accuracy</a>'),
+        _gr_row("4. Is the demand real?", "Free", "Every seller that got paid", '<a href="/organic">Real demand</a>'),
+    ])
+    + '<h3>1. Does the paywall work?</h3>'
+    '<p>Before paying anything, I ask each seller for its price and check what comes back. That gives a score out of 100.</p>'
+    + _gr_table(["What is checked", "Points"],
+                [_gr_row(html.escape(label), str(pts)) for _, label, pts in _probe.RUBRIC]
+                + [_gr_row("<b>Penalty:</b> it charges for pages that do not exist", f"&minus;{_probe.PHANTOM_PENALTY}"),
+                   _gr_row("<b>Bonus:</b> it has free pages to try first", f"+{_probe.FREE_TIER_BONUS}")])
+    + f'<p>{_gr_cuts}. Right now: {_gr_dist_txt}, plus {_gr_ungraded:,} with nothing I could test.</p>'
+    '<h3>2. Did it deliver?</h3>'
+    '<p>I pay once, using the example input from the seller\'s own listing, and check the response against '
+    'the fields the seller promised.</p>'
+    '<ul>'
+    '<li><b>Delivered:</b> every promised field came back.</li>'
+    '<li><b>Short:</b> I paid, but promised fields were missing. This only counts if a second paid call shows the same thing.</li>'
+    '<li><b>Inconclusive:</b> I could not get a clean response. That is my failure to measure, and it never counts against the seller.</li>'
+    '</ul>'
+    f'<p>So far: {_d_ok:,} delivered and {_gr_short:,} short. Every charge is matched to the payment on chain, '
+    'and every raw response is saved before it is graded.</p>'
+    '<h3>3. Was the answer right?</h3>'
+    '<p>Where a question has one right answer, I compare what the seller returned with a primary source, '
+    'never another reseller.</p>'
+    + _gr_table(["What I ask", "Checked against", "Right if within"],
+                [_gr_row(html.escape(c["metric"]), html.escape(c["source"]), html.escape(_gr_tol(c)))
+                 for c in _lab.CONFIG.values()])
+    + '<p>A seller can return every promised field and still get the number wrong, which is why this is its own grade.</p>'
+    '<h3>4. Is the demand real?</h3>'
+    '<p>From the blockchain, I look at who actually pays each seller and score the shape of that demand out of 100.</p>'
+    + _gr_table(["Part", "Points"], [_gr_row(html.escape(label), str(pts)) for _, label, pts in _lbm.ODS_PARTS])
+    + f'<p>Revenue is left out on purpose. A big number does not prove anyone wanted the product. A score under '
+    f'{_lbm.ODS_FLAG_BELOW} is flagged, and so is any seller where one wallet supplies '
+    f'{_lbm.ONE_WALLET_SHARE:.0%} or more of the money. That describes the shape of the demand, not wrongdoing: '
+    'one big real customer looks the same on chain as a seller paying itself.</p>'
+    '<h3>How it adds up: one verdict before you pay</h3>'
+    '<p>Agents get a single verdict per seller from <a href="/preflight">Preflight</a>.</p>'
+    + _gr_table(["Verdict", "When", "Right now"], [
+        _gr_row("<b>CLEAR</b>", "Positive evidence and nothing wrong: the price and payment address match, "
+                "and any paid calls delivered.", f'{_gl_counts.get("green", 0):,}'),
+        _gr_row("<b>HOLD</b>", "Something to check first: the live price does not match the listing, a short "
+                "delivery was confirmed twice, or an answer was wrong.", f'{_gl_counts.get("yellow", 0):,}'),
+        _gr_row("<b>ABORT</b>", "Hard evidence only: it pays to a different address than it lists, charges for "
+                "pages that do not exist, or took full payment and returned nothing, twice.",
+                f'{_gl_counts.get("red", 0):,}'),
+        _gr_row("<b>UNRATED</b>", "No data yet.", f'{_gl_counts.get("gray", 0):,}'),
+    ])
+    + f'<p>Each verdict also says how much it rests on. <b>Verified</b> means a payment to that seller settled '
+    f'and gave me a result I could grade ({_gr_conf.get("verified", 0):,}). <b>Probe only</b> means the free '
+    f'check ({_gr_conf.get("checked", 0):,}). <b>Unproven</b> means listed, with nothing measured yet '
+    f'({_gr_conf.get("unproven", 0):,}).</p>'
+    '<h3>The letter grades on reviews</h3>'
+    '<p>When I write up a purchase, the grade (A+ to F) is for one named behavior, like price honesty or revenue '
+    'accuracy, not the whole company. The verdict is one of Honest, Overcharged, Partial or No goods. So one '
+    'seller can hold an A for price honesty and a D for accuracy. '
+    '<a href="/p/answerpool-revenue-stale-tag">AnswerPool</a> is the example: most of its SEC data was fine, but '
+    'it served Apple\'s 2018 revenue as current, so it got a D on revenue accuracy.</p>'
+    '<h3>Rules I hold myself to</h3>'
+    '<ul>'
+    '<li>Nothing gets graded that I did not actually call.</li>'
+    '<li>Nobody pays to be listed or graded.</li>'
+    '<li>A negative finding needs two paid calls and a check on chain before it posts.</li>'
+    '<li>What a payment client reports is not evidence. The chain is.</li>'
+    '<li>When I get something wrong, the correction goes on the original post, with a date.</li>'
+    '</ul>'
+    '<p class="gclose">Every term is defined in the <a href="/glossary">glossary</a>. The grading code is public '
+    'at <a href="https://github.com/neilkpatel/whatagentsbuy">github.com/neilkpatel/whatagentsbuy</a>.</p>'
+    f'<p class="note dim">Counts as of {html.escape(D.get("date") or TODAY)} &middot; free probe of '
+    f'{len(_gr_origins):,} sellers, paid receipts, Base chain.</p>'
+    '</article>')
+
+write("grading/index.html", site_page(
+    "/grading", "How we grade x402 APIs: the rubric | What Agents Buy",
+    "How What Agents Buy grades the APIs AI agents pay for: a free check that the paywall works, paid checks "
+    "that the seller delivered and that the answer was right, and an on-chain score for whether the demand "
+    "is real, rolled into one CLEAR / HOLD / ABORT verdict.",
+    GRADING_BODY))
+urls.append("/grading")
 
 # --- /preflight/spec: the open contract --------------------------------------
 _pf_example = next((v for v in _gl_red if v.get("reasons")), (_gl_all[0] if _gl_all else None))
@@ -3612,7 +3743,8 @@ if _LAB:
         f'{_asof_txt} Machine-readable at <a href="/api/categories.json">/api/categories.json</a> and via the '
         '<code>most_accurate</code> MCP tool. Every grade is a verifiable <a href="/receipts">receipt</a>. '
         'A low deviation is measured, not asserted; where a seller returned nothing usable it is marked '
-        'inconclusive, never failed.</p>'
+        'inconclusive, never failed. The primary source and tolerance for each category are on '
+        '<a href="/grading">how we grade</a>.</p>'
         + ('<div class="vcards">' + "".join(_verdict_cards) + '</div>' if _verdict_cards else '')
         + "".join(_cat_html))
     write("categories/index.html", site_page(
@@ -4034,6 +4166,7 @@ _ll = [f"# What Agents Buy", "",
        f"rank_sellers (leaderboard by revenue or real_demand), rank_by_accuracy (a category by graded accuracy), "
        f"market_size (how big x402 is), known_payment_traps (how agents lose money). Old names still resolve.",
        f"  claude mcp add --transport http whatagentsbuy {SITE}/mcp",
+       f"How every verdict here is graded: {SITE}/grading — the free paywall score and its weights, delivery and accuracy grading, the Organic Demand Score, and what fires CLEAR / HOLD / ABORT.",
        "Integrate: give your agent one rule, \"call preflight(url) before paying any x402 API and gate on the "
        "verdict field (CLEAR / HOLD / ABORT / UNRATED); light is the same verdict as a colour\". Full drop-in recipe: https://github.com/neilkpatel/whatagentsbuy/blob/main/llms-install.md", ""]
 if LB:
@@ -4568,6 +4701,7 @@ json.dump({
     "stability": ("Field names in these JSON endpoints are stable within api_version 1. New fields may be "
                   "added; existing ones are not renamed or removed without bumping api_version. Numbers "
                   "change daily, so re-read rather than cache; each response carries a generated timestamp."),
+    "how_we_grade": f"{SITE}/grading — the rubric every verdict here comes from: the free paywall score and its weights, what delivered/short/inconclusive mean, the primary source and tolerance behind each accuracy grade, how the Organic Demand Score is built, and what fires CLEAR / HOLD / ABORT.",
     "start_here": ("If you are an agent deciding who to pay: call find_api on the MCP server to discover a "
                    "service (or most_accurate to rank an objective category by graded accuracy), then "
                    "preflight on your pick (detail:true for the full payment-safety read), then read the "
@@ -4826,8 +4960,14 @@ if _hits:
     # own testing, not agents, so report them but count "agent" traffic separately
     # rather than inflate the number with our own hits. Older hits predate client
     # logging and have no client; they fall into unknown.
+    # "test" is OUR OWN suite: Vercel deployed api/*.test.js as live functions, so
+    # every deploy (and every hit to /api/mcp.test) ran the tests server-side and
+    # logged their mock calls. That made our own test suite the single largest
+    # "tool caller" in this file. Shipping them is fixed in .vercelignore; the
+    # historical rows stay in the store and are excluded here by name.
     _TOOLING = {"curl", "wget", "unknown", "python-urllib", "python-requests",
-                "whatagentsbuy-x402", "touchstone-probe", "vercel", "go-http-client", "-", None}
+                "whatagentsbuy-x402", "touchstone-probe", "vercel", "go-http-client",
+                "test", "wab-diag-neil", "-", None}
     _by_client = collections.Counter((h.get("client") or "unknown") for h in _hits)
     _agent_tool_hits = [h for h in _hits if h.get("tool")
                         and (h.get("client") or "unknown") not in _TOOLING
@@ -4849,8 +4989,9 @@ if _hits:
         "by_client": dict(_by_client.most_common()),
         "distinct_clients": len(_by_client),
         "agent_traffic": {
-            "note": ("Excludes obvious tooling/self (curl, wget, our own probe UAs, and pre-attribution hits "
-                     "with no client). This is the credible 'which agents actually call this' number."),
+            "note": ("Excludes obvious tooling/self (curl, wget, our own probe UAs, our own test suite, and "
+                     "pre-attribution hits with no client). This is the credible 'which agents actually call "
+                     "this' number."),
             "tool_hits": len(_agent_tool_hits),
             "distinct_clients": len(_agent_clients),
             "clients": dict(_agent_clients.most_common()),

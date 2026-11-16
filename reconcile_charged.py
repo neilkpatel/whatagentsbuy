@@ -71,12 +71,23 @@ def reconcile(path, lookup=onchain_paid):
       unverified rows whose RPC lookup failed; marked charged_verified=False
     `lookup` is injectable so tests never touch the network.
     """
+    # Dated run files only. Run against conformance_verified.json on 2026-09-17,
+    # public-RPC rate limits marked 575 good rows charged_verified=false in one
+    # pass. The verified set is fed by promote_verified from reconciled dated files.
+    if os.path.basename(path) == "conformance_verified.json":
+        raise ValueError("reconcile dated conformance_<date>.json files, not the verified set")
     d = json.load(open(path))
     rows = d.get("rows", [])
     checked = corrected = cleared = unverified = 0
     changed = False
     for r in rows:
-        if not r.get("tx") or r.get("charged_reconciled"):
+        if not r.get("tx") or r.get("payment_reconciled"):
+            continue
+        # A row reconciled before the paid/free fix is skipped only if its flags
+        # already agree with a settled tx. On 2026-09-17 the client returned a tx
+        # hash with payment.success=false, so agentsapi.top read "served free"
+        # while the chain showed $0.01 leaving the wallet.
+        if r.get("charged_reconciled") and r.get("paid") and not r.get("free"):
             continue
         real = lookup(r["tx"])
         if real is None:
@@ -91,7 +102,14 @@ def reconcile(path, lookup=onchain_paid):
         c, q = r.get("charged"), r.get("quoted")
         r.pop("charged_verified", None)          # a chain read supersedes the mark
         r["charged_reconciled"] = True
+        r["payment_reconciled"] = True
         changed = True
+        # paid/free come from the chain too, not the client's success flag.
+        settled = real > TOL
+        if bool(r.get("paid")) != settled or (settled and r.get("free")):
+            r["paid_reported"], r["free_reported"] = r.get("paid"), r.get("free")
+            r["paid"] = settled
+            r["free"] = False if settled else r.get("status") == "delivered"
         if c is not None and abs((c or 0) - real) > TOL:
             r["charged_reported"] = c            # keep the client figure for the record
             r["charged"] = real                  # chain truth, both directions

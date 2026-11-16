@@ -7,9 +7,31 @@
 // UNRATED, never a false claim, and check_before_paying surfaces a payTo
 // mismatch as CRITICAL.
 
+// Never write telemetry from a test. The suite drives the real handler, which
+// calls logEvents(); when these files shipped as live Vercel functions that put
+// 68 mock rows into the production usage store under the client "test". Blank
+// env means logEvents returns before it fetches, whatever the environment holds.
+process.env.WAB_EVENTS_OFF = "1";
+
 import test from "node:test";
 import assert from "node:assert/strict";
-import handler, { normHost, rank, runTool, clientToken, clientKind, validateArgs, negotiateProtocol } from "./mcp.js";
+import handler, { normHost, rank, runTool, clientToken, clientKind, validateArgs, negotiateProtocol, logEvents } from "./mcp.js";
+
+test("telemetry never writes from a test run", async () => {
+  // These files shipped as live Vercel functions, so the suite's mock calls were
+  // logged to the production usage store as the client "test" (68 rows). The
+  // switch is checked when events are sent, so import order cannot defeat it.
+  let called = false;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => { called = true; return { ok: true }; };
+  try {
+    await logEvents([{ tool: "find_api", client: "test" }]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(called, false, "logEvents tried to POST during a test run");
+  assert.equal(process.env.WAB_EVENTS_OFF, "1");
+});
 
 test("clientKind counts only real agents as agents (honest measurement)", () => {
   // research/scanner/monitor tools are NOT agents, however they name themselves
@@ -295,6 +317,42 @@ test("an unknown tool name throws", async () => {
 });
 
 // ---- handler-level: raw-body parse errors and the batch cap (#4, #5) ----
+
+// A body the PLATFORM already parsed skipped the size cap entirely: `bodyParser:
+// false` is a Next.js setting, so on Vercel's Node runtime req.body arrives
+// pre-parsed and the streaming cap never ran. A 2MB body reached the live server
+// on 2026-09-17. These cover every path into readRawBody.
+function mockReqParsed(body, headers = {}) {
+  return { method: "POST", headers, body,
+           [Symbol.asyncIterator]: async function* () {} };
+}
+
+test("handler: an oversized PRE-PARSED body is refused, not just a streamed one", async () => {
+  const res = mockRes();
+  await handler(mockReqParsed({ jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "find_api", arguments: { task: "x".repeat(1_200_000) } } }), res);
+  assert.equal(res.statusCode, 413);
+  assert.match(res.body.error.message, /request too large/);
+});
+
+test("handler: an oversized content-length is refused before the body is read", async () => {
+  const res = mockRes();
+  await handler(mockReqParsed(null, { "content-length": "2000000" }), res);
+  assert.equal(res.statusCode, 413);
+  assert.match(res.body.error.message, /request too large/);
+});
+
+test("handler: a normal pre-parsed body still works", async () => {
+  const res = mockRes();
+  await handler(mockReqParsed({ jsonrpc: "2.0", id: 7, method: "ping" }), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { jsonrpc: "2.0", id: 7, result: {} });
+});
+
+test("find_api does not mirror a huge task argument back", async () => {
+  const out = await runTool("find_api", { task: "y".repeat(5000) });
+  assert.ok(out.task.length <= 520, `echoed ${out.task.length} chars`);
+});
 
 test("handler: malformed JSON body returns a proper JSON-RPC -32700", async () => {
   const res = mockRes();
