@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How submissions work, and the public queue
+    url: https://whatagentsbuy.com/submit
+    about: Read this before asking for a paid check. It shows who is already waiting.
+  - name: How grades are made
+    url: https://whatagentsbuy.com/grading
+    about: The rubric behind every grade and verdict.

@@ -1,0 +1,88 @@
+name: Seller submission
+description: Ask for an independent paid check of your x402 service. Free, unsponsored, no date promised.
+title: "Seller submission: <your host>"
+labels: ["seller-submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read https://whatagentsbuy.com/submit first. It explains what happens and shows the public queue.
+
+        I buy from your service with my own wallet and publish what was quoted, what was charged and whether the goods arrived. Nobody pays to be checked, and asking does not earn a good grade. The price and payment address are read from your live 402 at the moment of purchase, never from this form.
+  - type: input
+    id: url
+    attributes:
+      label: Service URL
+      placeholder: https://api.example.com
+    validations:
+      required: true
+  - type: input
+    id: catalog
+    attributes:
+      label: Where the catalog lives
+      description: /.well-known/x402, openapi.json, or a docs page.
+      placeholder: https://api.example.com/.well-known/x402
+    validations:
+      required: true
+  - type: textarea
+    id: routes
+    attributes:
+      label: Paid routes and prices
+      description: One per line. Method, path, price in USDC, one line on what it returns.
+      placeholder: "GET /v1/thing?x= 0.005 (returns ...)"
+    validations:
+      required: true
+  - type: input
+    id: cheapest
+    attributes:
+      label: The cheapest real test
+      description: The route I should buy first, with an example request that should succeed.
+    validations:
+      required: true
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      options:
+        - Base
+        - Solana
+        - Other (say which in the notes)
+    validations:
+      required: true
+  - type: input
+    id: payto
+    attributes:
+      label: payTo address
+      description: For reference only. The address I pay is the one in your live 402.
+    validations:
+      required: true
+  - type: dropdown
+    id: payto_shared
+    attributes:
+      label: Is that payTo yours alone?
+      description: The leaderboard counts money by address. A shared address would credit you with other sellers' sales, so please say so.
+      options:
+        - "Yes, only my service is paid at this address"
+        - "No, it belongs to a facilitator or settlement provider other sellers also use"
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: checkable
+    attributes:
+      label: What makes the answer checkable
+      description: A free sample route, or a public source the result can be compared against. Optional, but it is what lets a service be graded for accuracy and not only delivery.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Other hosts you run (one submission per operator, please), known limits, real payments so far.
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Before you submit
+      options:
+        - label: I run this service, or I am submitting it for the person who does.
+          required: true
+        - label: I understand the result is published whatever it is, and that nobody pays for a check or a grade.
+          required: true
